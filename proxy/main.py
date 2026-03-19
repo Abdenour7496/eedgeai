@@ -1,45 +1,61 @@
 """
-Graph-Centric Orchestrated Retrieval (GCOR) proxy for OpenWebUI.
+Graph-Centric Orchestrated Retrieval (GCOR) proxy — Cognitive Infrastructure.
 
 Architecture
 ────────────
   Neo4j   = cognitive backbone   (primary truth, structure, reasoning)
   Qdrant  = semantic perception  (index over Neo4j nodes, similarity only)
 
+─────────────────────────────────────────────────────────────────────────────
+Cognitive infrastructure additions over baseline GCOR:
+
+  Confidence filtering
+    • Qdrant hits below CONFIDENCE_THRESHOLD are dropped before expansion
+    • Neo4j expansion uses $min_conf to filter Memory/Inference/Belief
+
+  Temporal validity
+    • Qdrant hits with expired valid_to are dropped (dead knowledge)
+    • Neo4j expansion passes $now so queries respect valid_to
+
+  Agent partitioning
+    • AGENT_ID env var scopes Memory/Belief/Inference to one agent
+    • Access-control filter drops hits whose access_level forbids $AGENT_ID
+
+  New intents
+    • inference   → resolve :Inference chains and their evidence
+    • belief      → retrieve :Belief nodes and contradiction graph
+
+─────────────────────────────────────────────────────────────────────────────
 Retrieval flow for every /v1/chat/completions request
 ─────────────────────────────────────────────────────
   1. INTENT CLASSIFICATION
-     Classify the query: factual / planning / dependency / memory / semantic
+     factual | planning | dependency | memory | semantic | inference | belief
 
   2. SEMANTIC PHASE  (Qdrant)
-     Embed the query → top-K candidate Chunk nodes
-     Each hit carries neo4j_element_id — not the answer, just a pointer
+     Embed → top-K candidate nodes
+     Filter by: score, confidence, temporal validity, access control
 
   3. STRUCTURAL PHASE  (Neo4j)
-     For each candidate element_id, expand the graph:
-       factual    → node + immediate relationships + source document
-       planning   → node + DEPENDS_ON chain (2 hops) + sibling goals
-       dependency → full DEPENDS_ON path (3 hops)
-       memory     → node + ABOUT concepts + ABOUT memories + timeline
-       semantic   → node + MENTIONS concepts + FOLLOWS neighbors
+     Intent-specific Cypher with confidence + temporal + agent_id params
 
-  4. REFLECTION CHECK  (lightweight)
-     If Neo4j returns nothing but Qdrant has hits, fall back to chunk text.
-     If both return nothing, answer from LLM general knowledge.
+  4. REFLECTION CHECK
+     Neo4j empty but Qdrant has hits → fall back to chunk text
+     Both empty → LLM general knowledge
 
   5. CONTEXT INJECTION
-     Build a structured system message and call the LLM.
+     Structured system message including confidence scores
 
 Other endpoints
 ───────────────
   GET  /v1/models      → live OpenAI model list (with fallback)
-  POST /v1/embeddings  → proxied to OpenAI (for OpenWebUI's own RAG)
+  POST /v1/embeddings  → proxied to OpenAI
   GET  /health         → liveness check
 """
 
 import json
 import logging
 import os
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -51,18 +67,18 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# ── LLM backends ──────────────────────────────────────────────────────────────
+# ── LLM backends ───────────────────────────────────────────────────────────────
 OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
 OPENAI_CHAT_MODEL    = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")
 ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_CHAT_MODEL = os.getenv("ANTHROPIC_CHAT_MODEL", "claude-sonnet-4-6")
 LLM_BACKEND          = os.getenv("LLM_BACKEND", "openai")
 
-# ── Embedding ─────────────────────────────────────────────────────────────────
+# ── Embedding ──────────────────────────────────────────────────────────────────
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
 # ── Qdrant (semantic perception layer) ────────────────────────────────────────
-QDRANT_URL        = os.getenv("QDRANT_URL",        "http://quarant:6333")
+QDRANT_URL        = os.getenv("QDRANT_URL",        "http://qdrant:6333")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "documents")
 QDRANT_TOP_K      = int(os.getenv("QDRANT_TOP_K",  "8"))
 
@@ -73,6 +89,12 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "test1234")
 NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
 
 ENABLE_RAG = os.getenv("ENABLE_RAG", "true").lower() in ("true", "1", "yes")
+
+# ── Cognitive infrastructure knobs ────────────────────────────────────────────
+# Minimum confidence (0.0–1.0) — hits below this are discarded
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.0"))
+# Agent id scopes memory/belief/inference retrieval to a single partition
+AGENT_ID = os.getenv("AGENT_ID", "")
 
 
 # ── Step 1: Intent classification ─────────────────────────────────────────────
@@ -86,7 +108,14 @@ _INTENT_KEYWORDS = {
                     "past", "earlier", "before we", "you said", "i told"],
     "factual":     ["what is", "how does", "why", "explain", "define", "describe",
                     "tell me about", "how do", "what are"],
+    "inference":   ["infer", "conclude", "deduce", "reasoning", "derive",
+                    "implication", "therefore", "follows that", "suggests",
+                    "implies", "logical", "because of"],
+    "belief":      ["believe", "think", "opinion", "doubt", "uncertain",
+                    "probably", "likely", "assume", "suppose", "suspect",
+                    "my view", "i think"],
 }
+
 
 def classify_intent(query: str) -> str:
     q = query.lower()
@@ -97,6 +126,10 @@ def classify_intent(query: str) -> str:
 
 
 # ── Step 2a: Semantic phase (Qdrant) ──────────────────────────────────────────
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 async def embed_text(text: str) -> list | None:
     if not OPENAI_API_KEY:
@@ -116,7 +149,7 @@ async def embed_text(text: str) -> list | None:
 
 
 async def qdrant_search(vector: list) -> list:
-    """Return top-K Qdrant hits; each hit includes the full payload (with neo4j_element_id)."""
+    """Return top-K Qdrant hits; each hit includes the full payload."""
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             resp = await c.post(
@@ -133,22 +166,58 @@ async def qdrant_search(vector: list) -> list:
         return []
 
 
+def _filter_hits(hits: list) -> list:
+    """
+    Apply cognitive filters to raw Qdrant hits:
+      1. Confidence threshold — payload.confidence below minimum is discarded
+      2. Temporal validity   — expired valid_to is discarded
+      3. Access control      — access_level incompatible with AGENT_ID is discarded
+    """
+    now = _now_iso()
+    filtered = []
+    for h in hits:
+        p = h.get("payload") or {}
+
+        # ── confidence ────────────────────────────────────────────────────────
+        node_confidence = p.get("confidence")
+        if node_confidence is not None and node_confidence < CONFIDENCE_THRESHOLD:
+            logger.debug("Dropping hit %s: confidence %.2f < %.2f",
+                         h.get("id"), node_confidence, CONFIDENCE_THRESHOLD)
+            continue
+
+        # ── temporal validity ─────────────────────────────────────────────────
+        valid_to = p.get("valid_to")
+        if valid_to and valid_to < now:
+            logger.debug("Dropping hit %s: expired valid_to %s", h.get("id"), valid_to)
+            continue
+
+        # ── access control ────────────────────────────────────────────────────
+        access_level = p.get("access_level", "public")
+        if access_level == "restricted":
+            logger.debug("Dropping hit %s: restricted access", h.get("id"))
+            continue
+        if access_level.startswith("agent:") and AGENT_ID:
+            owner = access_level.split(":", 1)[1]
+            if owner != AGENT_ID:
+                logger.debug("Dropping hit %s: owned by %s, not %s", h.get("id"), owner, AGENT_ID)
+                continue
+
+        filtered.append(h)
+    return filtered
+
+
 # ── Step 2b: Structural phase (Neo4j) ─────────────────────────────────────────
 
-# Intent-specific Cypher — all return {node, labels, document, [extras]}
 _EXPAND_CYPHER = {
     "factual": """
         MATCH (n) WHERE elementId(n) IN $ids
         OPTIONAL MATCH (n)-[r]-(related)
         OPTIONAL MATCH (n)<-[:HAS_CHUNK]-(doc:Document)
         RETURN
-            properties(n) AS node,
-            labels(n)     AS labels,
+            properties(n) AS node, labels(n) AS labels,
             properties(doc) AS document,
             collect(DISTINCT {
-                rel:   type(r),
-                props: properties(related),
-                lbls:  labels(related)
+                rel: type(r), props: properties(related), lbls: labels(related)
             })[..6] AS related
         LIMIT 20
     """,
@@ -157,12 +226,14 @@ _EXPAND_CYPHER = {
         OPTIONAL MATCH (n)-[:DEPENDS_ON*1..2]->(dep)
         OPTIONAL MATCH (n)<-[:HAS_CHUNK]-(doc:Document)
         OPTIONAL MATCH (g:Goal)-[:DEPENDS_ON]->(n)
+        OPTIONAL MATCH (inf:Inference)-[:SUPPORTS]->(n)
+            WHERE inf.confidence >= $min_conf
         RETURN
-            properties(n) AS node,
-            labels(n)     AS labels,
+            properties(n) AS node, labels(n) AS labels,
             properties(doc) AS document,
-            collect(DISTINCT properties(dep))[..5] AS dependencies,
-            collect(DISTINCT properties(g))[..5]   AS blocking_goals
+            collect(DISTINCT properties(dep))[..5]   AS dependencies,
+            collect(DISTINCT properties(g))[..5]     AS blocking_goals,
+            collect(DISTINCT properties(inf))[..3]   AS supporting_inferences
         LIMIT 20
     """,
     "dependency": """
@@ -170,8 +241,7 @@ _EXPAND_CYPHER = {
         OPTIONAL MATCH path = (n)-[:DEPENDS_ON*1..3]->(dep)
         OPTIONAL MATCH (n)<-[:HAS_CHUNK]-(doc:Document)
         RETURN
-            properties(n)  AS node,
-            labels(n)      AS labels,
+            properties(n)  AS node, labels(n) AS labels,
             properties(doc) AS document,
             [x IN nodes(path) | properties(x)][..8] AS dependency_chain
         LIMIT 20
@@ -180,14 +250,21 @@ _EXPAND_CYPHER = {
         MATCH (n) WHERE elementId(n) IN $ids
         OPTIONAL MATCH (n)-[:MENTIONS]->(concept:Concept)
         OPTIONAL MATCH (mem:Memory)-[:ABOUT]->(concept)
+            WHERE ($agent_id = '' OR mem.agent_id = $agent_id)
+              AND mem.confidence >= $min_conf
+              AND (mem.valid_to IS NULL OR mem.valid_to >= $now)
+        OPTIONAL MATCH (bel:Belief)-[:ABOUT]->(concept)
+            WHERE ($agent_id = '' OR bel.agent_id = $agent_id)
+              AND bel.confidence >= $min_conf
+              AND (bel.valid_to IS NULL OR bel.valid_to >= $now)
         OPTIONAL MATCH (evt:Event)-[:INVOLVES]->(concept)
         OPTIONAL MATCH (n)<-[:HAS_CHUNK]-(doc:Document)
         RETURN
-            properties(n)   AS node,
-            labels(n)       AS labels,
+            properties(n)   AS node, labels(n) AS labels,
             properties(doc) AS document,
             collect(DISTINCT properties(concept))[..5] AS concepts,
             collect(DISTINCT properties(mem))[..5]     AS memories,
+            collect(DISTINCT properties(bel))[..3]     AS beliefs,
             collect(DISTINCT properties(evt))[..5]     AS events
         ORDER BY evt.timestamp DESC
         LIMIT 20
@@ -198,11 +275,44 @@ _EXPAND_CYPHER = {
         OPTIONAL MATCH (n)-[:FOLLOWS]-(neighbor:Chunk)
         OPTIONAL MATCH (n)<-[:HAS_CHUNK]-(doc:Document)
         RETURN
-            properties(n)   AS node,
-            labels(n)       AS labels,
+            properties(n)   AS node, labels(n) AS labels,
             properties(doc) AS document,
             collect(DISTINCT properties(concept))[..5]  AS concepts,
             collect(DISTINCT properties(neighbor))[..3] AS neighbors
+        LIMIT 20
+    """,
+    "inference": """
+        MATCH (n) WHERE elementId(n) IN $ids
+        OPTIONAL MATCH (n)-[:DERIVED_FROM]->(src)
+        OPTIONAL MATCH (n)-[:SUPPORTS]->(tgt)
+        OPTIONAL MATCH (n)<-[:HAS_CHUNK]-(doc:Document)
+        OPTIONAL MATCH (downstream:Inference)-[:DERIVED_FROM]->(n)
+            WHERE downstream.confidence >= $min_conf
+              AND ($agent_id = '' OR downstream.agent_id = $agent_id)
+              AND (downstream.valid_to IS NULL OR downstream.valid_to >= $now)
+        RETURN
+            properties(n)   AS node, labels(n) AS labels,
+            properties(doc) AS document,
+            collect(DISTINCT properties(src))[..5]        AS sources,
+            collect(DISTINCT properties(tgt))[..5]        AS supports,
+            collect(DISTINCT properties(downstream))[..3] AS downstream_inferences
+        LIMIT 20
+    """,
+    "belief": """
+        MATCH (n) WHERE elementId(n) IN $ids
+        OPTIONAL MATCH (a:Agent)-[:HOLDS]->(n)
+        OPTIONAL MATCH (n)-[:ABOUT]->(concept:Concept)
+        OPTIONAL MATCH (n)-[:CONTRADICTS]-(other:Belief)
+            WHERE other.confidence >= $min_conf
+        OPTIONAL MATCH (inf:Inference)-[:SUPPORTS]->(n)
+            WHERE inf.confidence >= $min_conf
+              AND (inf.valid_to IS NULL OR inf.valid_to >= $now)
+        RETURN
+            properties(n)   AS node, labels(n) AS labels, null AS document,
+            properties(a)   AS agent,
+            collect(DISTINCT properties(concept))[..5] AS concepts,
+            collect(DISTINCT properties(other))[..3]   AS contradictions,
+            collect(DISTINCT properties(inf))[..3]     AS supporting_inferences
         LIMIT 20
     """,
 }
@@ -210,19 +320,31 @@ _EXPAND_CYPHER = {
 _FALLBACK_CYPHER = """
     MATCH (n)
     WHERE any(k IN keys(n) WHERE toLower(toString(n[k])) CONTAINS toLower($q))
+      AND coalesce(n.confidence, 1.0) >= $min_conf
+      AND (n.valid_to IS NULL OR n.valid_to >= $now)
     RETURN properties(n) AS node, labels(n) AS labels, null AS document
     LIMIT 10
 """
 
 
-async def neo4j_expand(element_ids: list, intent: str, query: str) -> list:
+async def neo4j_expand(
+    element_ids: list,
+    intent: str,
+    query: str,
+) -> list:
     """Expand the graph around Qdrant candidate nodes based on intent."""
     cypher = _EXPAND_CYPHER.get(intent, _EXPAND_CYPHER["semantic"])
-    params = {"ids": element_ids} if element_ids else {}
+    now = _now_iso()
+    params = {
+        "ids":      element_ids,
+        "agent_id": AGENT_ID,
+        "min_conf": CONFIDENCE_THRESHOLD,
+        "now":      now,
+    }
 
     if not element_ids:
         cypher = _FALLBACK_CYPHER
-        params = {"q": query[:100]}
+        params  = {"q": query[:100], "min_conf": CONFIDENCE_THRESHOLD, "now": now}
 
     try:
         driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
@@ -240,15 +362,20 @@ async def neo4j_expand(element_ids: list, intent: str, query: str) -> list:
 # ── Step 3: Reflection ─────────────────────────────────────────────────────────
 
 def _reflection_fallback(qdrant_hits: list, graph_records: list) -> list:
-    """If graph is empty but Qdrant has hits, use raw chunk text as fallback context."""
     if graph_records:
         return graph_records
     if qdrant_hits:
         logger.info("Reflection: Neo4j empty, falling back to Qdrant chunk text.")
         return [
             {
-                "node":     {"text": h["payload"].get("text", ""), "document_id": h["payload"].get("document_id", "")},
-                "labels":   ["Chunk"],
+                "node": {
+                    "text":        h["payload"].get("text", ""),
+                    "document_id": h["payload"].get("document_id", ""),
+                    "confidence":  h["payload"].get("confidence"),
+                    "valid_from":  h["payload"].get("valid_from"),
+                    "valid_to":    h["payload"].get("valid_to"),
+                },
+                "labels":   [h["payload"].get("node_type", "Chunk")],
                 "document": {"title": h["payload"].get("document_title", "")},
             }
             for h in qdrant_hits
@@ -259,17 +386,49 @@ def _reflection_fallback(qdrant_hits: list, graph_records: list) -> list:
 
 # ── Context builder ────────────────────────────────────────────────────────────
 
+def _confidence_badge(props: dict) -> str:
+    c = props.get("confidence")
+    if c is None:
+        return ""
+    pct = int(c * 100)
+    if pct >= 90:
+        tier = "high"
+    elif pct >= 60:
+        tier = "medium"
+    else:
+        tier = "low"
+    return f"  [confidence: {pct}% / {tier}]"
+
+
+def _temporal_badge(props: dict) -> str:
+    parts = []
+    vf = props.get("valid_from")
+    vt = props.get("valid_to")
+    if vf:
+        parts.append(f"from {vf[:10]}")
+    if vt:
+        parts.append(f"to {vt[:10]}")
+    return f"  [valid {', '.join(parts)}]" if parts else ""
+
+
 def build_gcor_context(intent: str, qdrant_hits: list, graph_records: list) -> str:
-    """Build a structured system-message context block from GCOR results."""
     records = _reflection_fallback(qdrant_hits, graph_records)
     if not records:
         return ""
 
+    confidence_note = (
+        f"confidence ≥ {int(CONFIDENCE_THRESHOLD*100)}% "
+        if CONFIDENCE_THRESHOLD > 0 else ""
+    )
+    agent_note = f"agent partition: {AGENT_ID} " if AGENT_ID else ""
+
     lines = [
         f"## Retrieved Context  [intent: {intent} | "
-        f"{len(qdrant_hits)} semantic candidates → {len(records)} graph records]",
+        f"{len(qdrant_hits)} semantic candidates → {len(records)} graph records"
+        + (f" | {confidence_note}{agent_note}".rstrip() if (confidence_note or agent_note) else "")
+        + "]",
         "",
-        "Neo4j is the primary source. Qdrant identified the entry points.",
+        "Neo4j is the primary source of truth. Qdrant identified the entry points.",
         "",
     ]
 
@@ -282,13 +441,20 @@ def build_gcor_context(intent: str, qdrant_hits: list, graph_records: list) -> s
         content   = (
             node.get("text") or node.get("content") or
             node.get("description") or node.get("title") or
-            str(node)
+            node.get("subject") or str(node)
         )[:600]
 
-        lines.append(f"### [{node_type}]  {content}")
+        conf_badge    = _confidence_badge(node)
+        temporal_badge = _temporal_badge(node)
+        lines.append(f"### [{node_type}]{conf_badge}{temporal_badge}")
+        lines.append(content)
 
         if doc.get("title") or doc.get("source"):
             lines.append(f"Source: {doc.get('title') or doc.get('source', '')}")
+
+        # Reasoning trace for Inference nodes
+        if node.get("reasoning_trace"):
+            lines.append(f"Reasoning: {node['reasoning_trace'][:300]}")
 
         # Intent-specific extras
         if intent == "planning":
@@ -302,6 +468,12 @@ def build_gcor_context(intent: str, qdrant_hits: list, graph_records: list) -> s
                 lines.append("Blocked by: " + ", ".join(
                     g.get("description") or str(g) for g in blocking
                 ))
+            inferences = [i for i in (rec.get("supporting_inferences") or []) if i]
+            if inferences:
+                lines.append("Supporting inferences: " + "; ".join(
+                    f"{i.get('text', '')[:80]} ({int(i.get('confidence', 0)*100)}%)"
+                    for i in inferences
+                ))
 
         elif intent == "dependency":
             chain = [x for x in (rec.get("dependency_chain") or []) if x]
@@ -313,14 +485,59 @@ def build_gcor_context(intent: str, qdrant_hits: list, graph_records: list) -> s
         elif intent == "memory":
             mems = [m for m in (rec.get("memories") or []) if m]
             if mems:
-                lines.append("Related memories: " + "; ".join(
-                    m.get("content") or str(m) for m in mems[:3]
+                lines.append("Memories: " + "; ".join(
+                    f"{m.get('content', '')[:80]}{_confidence_badge(m)}"
+                    for m in mems[:3]
+                ))
+            beliefs = [b for b in (rec.get("beliefs") or []) if b]
+            if beliefs:
+                lines.append("Beliefs: " + "; ".join(
+                    f"{b.get('content', '')[:80]}{_confidence_badge(b)}"
+                    for b in beliefs[:3]
                 ))
             evts = [e for e in (rec.get("events") or []) if e]
             if evts:
-                lines.append("Related events: " + "; ".join(
-                    f"{e.get('timestamp', '')} {e.get('description', '')}" for e in evts[:3]
+                lines.append("Events: " + "; ".join(
+                    f"{e.get('timestamp', '')[:10]} {e.get('description', '')}"
+                    for e in evts[:3]
                 ))
+
+        elif intent == "inference":
+            srcs = [s for s in (rec.get("sources") or []) if s]
+            if srcs:
+                lines.append("Derived from: " + "; ".join(
+                    (s.get("text") or s.get("content") or str(s))[:80]
+                    for s in srcs[:3]
+                ))
+            supports = [t for t in (rec.get("supports") or []) if t]
+            if supports:
+                lines.append("Supports: " + "; ".join(
+                    (t.get("description") or t.get("content") or str(t))[:80]
+                    for t in supports[:3]
+                ))
+            downstream = [d for d in (rec.get("downstream_inferences") or []) if d]
+            if downstream:
+                lines.append("Downstream inferences: " + "; ".join(
+                    f"{d.get('text', '')[:60]}{_confidence_badge(d)}"
+                    for d in downstream[:2]
+                ))
+
+        elif intent == "belief":
+            contradictions = [c for c in (rec.get("contradictions") or []) if c]
+            if contradictions:
+                lines.append("Contradicts: " + "; ".join(
+                    f"{c.get('content', '')[:80]}{_confidence_badge(c)}"
+                    for c in contradictions[:2]
+                ))
+            inferences = [i for i in (rec.get("supporting_inferences") or []) if i]
+            if inferences:
+                lines.append("Supported by: " + "; ".join(
+                    f"{i.get('text', '')[:60]}{_confidence_badge(i)}"
+                    for i in inferences[:2]
+                ))
+            agent = rec.get("agent") or {}
+            if agent.get("id"):
+                lines.append(f"Held by agent: {agent['id']}")
 
         elif intent == "semantic":
             concepts = [c for c in (rec.get("concepts") or []) if c]
@@ -344,7 +561,9 @@ def build_gcor_context(intent: str, qdrant_hits: list, graph_records: list) -> s
 
     lines.append(
         "Instruction: use the retrieved context above when relevant. "
-        "If the context is insufficient, apply general knowledge."
+        "Respect the confidence scores — lower-confidence information should be "
+        "presented with appropriate uncertainty. If the context is insufficient, "
+        "apply general knowledge."
     )
     return "\n".join(lines)
 
@@ -355,7 +574,8 @@ def inject_context(messages: list, context: str) -> list:
     result, merged = [], False
     for m in messages:
         if m.get("role") == "system" and not merged:
-            result.append({"role": "system", "content": context + "\n\n---\n\n" + m.get("content", "")})
+            result.append({"role": "system",
+                           "content": context + "\n\n---\n\n" + m.get("content", "")})
             merged = True
         else:
             result.append(m)
@@ -473,13 +693,13 @@ async def call_anthropic(body: dict):
                              "message": {"role": "assistant",
                                          "content": ant.get("content", [{}])[0].get("text", "")},
                              "finish_reason": ant.get("stop_reason", "stop")}],
-                "usage": {"prompt_tokens": usage.get("input_tokens", 0),
+                "usage": {"prompt_tokens":    usage.get("input_tokens", 0),
                           "completion_tokens": usage.get("output_tokens", 0),
-                          "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0)},
+                          "total_tokens":      usage.get("input_tokens", 0) + usage.get("output_tokens", 0)},
             })
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.get("/v1/models")
 async def list_models():
@@ -512,13 +732,15 @@ async def embeddings(request: Request):
         async with httpx.AsyncClient(timeout=30) as c:
             resp = await c.post(
                 "https://api.openai.com/v1/embeddings",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
+                         "Content-Type": "application/json"},
                 json=body,
             )
             resp.raise_for_status()
             return JSONResponse(content=resp.json())
     except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=exc.response.status_code, detail="Embeddings upstream error")
+        raise HTTPException(status_code=exc.response.status_code,
+                            detail="Embeddings upstream error")
     except Exception as exc:
         logger.error("Embeddings failed: %s", exc)
         raise HTTPException(status_code=502, detail="Embeddings request failed")
@@ -533,26 +755,29 @@ async def chat_completions(request: Request):
         query = last_user_text(messages)
 
         if query:
-            # ── Step 1: Intent ─────────────────────────────────────────────────
+            # ── Step 1: Intent ──────────────────────────────────────────────
             intent = classify_intent(query)
             logger.info("GCOR intent: %s", intent)
 
-            # ── Step 2a: Semantic phase (Qdrant → element IDs) ─────────────────
-            vector       = await embed_text(query)
-            qdrant_hits  = await qdrant_search(vector) if vector else []
-            element_ids  = [
+            # ── Step 2a: Semantic (Qdrant → element IDs) ────────────────────
+            vector      = await embed_text(query)
+            raw_hits    = await qdrant_search(vector) if vector else []
+            qdrant_hits = _filter_hits(raw_hits)
+            element_ids = [
                 h["payload"]["neo4j_element_id"]
                 for h in qdrant_hits
                 if h.get("payload", {}).get("neo4j_element_id")
             ]
-            logger.info("Qdrant: %d candidates, %d with neo4j_element_id",
-                        len(qdrant_hits), len(element_ids))
+            logger.info(
+                "Qdrant: %d raw → %d after cognitive filters, %d with neo4j_element_id",
+                len(raw_hits), len(qdrant_hits), len(element_ids),
+            )
 
-            # ── Step 2b: Structural phase (Neo4j graph expansion) ──────────────
+            # ── Step 2b: Structural (Neo4j graph expansion) ─────────────────
             graph_records = await neo4j_expand(element_ids, intent, query)
             logger.info("Neo4j: %d graph records expanded", len(graph_records))
 
-            # ── Step 3: Reflection + context build ─────────────────────────────
+            # ── Step 3: Reflection + context build ──────────────────────────
             context  = build_gcor_context(intent, qdrant_hits, graph_records)
             messages = inject_context(messages, context)
             body     = {**body, "messages": messages}
@@ -579,4 +804,9 @@ async def chat_completions(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status":               "ok",
+        "rag":                  ENABLE_RAG,
+        "confidence_threshold": CONFIDENCE_THRESHOLD,
+        "agent_id":             AGENT_ID or None,
+    }

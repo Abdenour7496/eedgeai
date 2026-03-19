@@ -1,25 +1,49 @@
 """
-Qdrant MCP server for OpenClaw — GCOR Edition.
+Qdrant MCP server — GCOR Cognitive Infrastructure edition.
 
 GCOR principle: Qdrant is a semantic index over Neo4j.
-Every point carries neo4j_element_id in its payload so the proxy
+Every point carries neo4j_element_id (and cognitive metadata) so the proxy
 can hop from a semantic hit straight back to the graph.
 
-Uses the official qdrant-client (async) with:
-  - Persistent AsyncQdrantClient (connection pool managed by the SDK)
-  - Exponential-backoff retry on transient errors
-  - Full GCOR tool set:
-      qdrant_list_collections      — enumerate collections
-      qdrant_collection_info       — vector size, point count, status
-      qdrant_count                 — count points (optionally filtered)
-      qdrant_search                — semantic search, always returns neo4j_element_id
-      qdrant_search_by_neo4j_id    — look up Qdrant point by graph element ID
-      qdrant_upsert_chunk          — GCOR-aware upsert (requires neo4j_element_id)
-      qdrant_upsert                — free-form upsert (legacy / ad-hoc)
-      qdrant_delete_points         — delete by IDs
-      qdrant_delete_collection     — drop a collection
-      sync_neo4j_to_qdrant         — pull Chunk nodes from Neo4j → embed → index
-      qdrant_gcor_status           — health check: counts per node_type in collection
+─────────────────────────────────────────────────────────────────────────────
+Cognitive infrastructure additions:
+
+  Confidence scoring
+    • confidence (0.0–1.0) stored in every point's payload
+    • qdrant_search filters by min_confidence parameter
+
+  Temporal validity
+    • valid_from / valid_to in every point's payload
+    • qdrant_search_temporal — filter to a specific time window
+    • Expired points are returned but flagged (the proxy drops them)
+
+  Agent partitioning
+    • agent_id in payload — restricts search to one agent's cognitive space
+    • qdrant_search and qdrant_search_temporal both accept agent_id filter
+
+  Access control
+    • access_level ("public" | "restricted" | "agent:<id>") in payload
+    • qdrant_search accepts access_level filter
+
+  Self-reflective node types
+    • node_type supports: Chunk | Memory | Inference | Belief | Goal | Event
+    • All GCOR-aware tools filter by node_type
+
+─────────────────────────────────────────────────────────────────────────────
+Tools
+  qdrant_list_collections      list all collections
+  qdrant_collection_info       vector size, point count, status
+  qdrant_count                 count points (optionally by node_type / agent_id)
+  qdrant_search                semantic search with cognitive filters
+  qdrant_search_temporal       search restricted to a temporal validity window
+  qdrant_search_by_neo4j_id    look up Qdrant point by graph element ID
+  qdrant_upsert_chunk          GCOR-aware upsert (all cognitive fields)
+  qdrant_upsert                free-form upsert (ad-hoc / legacy)
+  qdrant_delete_points         delete by IDs
+  qdrant_delete_collection     drop a collection
+  qdrant_gcor_status           health check: counts per node_type
+  sync_neo4j_to_qdrant         pull nodes from Neo4j → embed → index with full
+                               cognitive payload (confidence, temporal, ACL)
 
 Exposed to OpenClaw via SSE on 0.0.0.0:8765.
 """
@@ -28,6 +52,7 @@ import asyncio
 import json
 import os
 import uuid
+from datetime import datetime, timezone
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -39,10 +64,11 @@ from qdrant_client.models import (
     MatchValue,
     PointIdsList,
     PointStruct,
+    Range,
     VectorParams,
 )
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────────────
 QDRANT_URL      = os.getenv("QDRANT_URL",        "http://qdrant:6333")
 QDRANT_API_KEY  = os.getenv("QDRANT_API_KEY",    "")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME",   "documents")
@@ -57,6 +83,8 @@ NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
 
 HOST = os.getenv("QDRANT_MCP_HOST", "0.0.0.0")
 PORT = int(os.getenv("QDRANT_MCP_PORT", "8765"))
+
+DEFAULT_ACCESS = os.getenv("DEFAULT_ACCESS_LEVEL", "public")
 
 # ── Qdrant client (singleton) ─────────────────────────────────────────────────
 _client: AsyncQdrantClient | None = None
@@ -73,7 +101,7 @@ def get_client() -> AsyncQdrantClient:
     return _client
 
 
-# ── Retry helper ──────────────────────────────────────────────────────────────
+# ── Retry helper ───────────────────────────────────────────────────────────────
 async def with_retry(coro_fn, retries: int = MAX_RETRY):
     for attempt in range(retries):
         try:
@@ -84,9 +112,8 @@ async def with_retry(coro_fn, retries: int = MAX_RETRY):
             await asyncio.sleep(2 ** attempt)
 
 
-# ── Embedding ─────────────────────────────────────────────────────────────────
+# ── Embedding ──────────────────────────────────────────────────────────────────
 async def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Embed a batch of texts via OpenAI and return a list of vectors."""
     if not OPENAI_API_KEY:
         raise ValueError("OPENAI_API_KEY is not set — cannot embed text")
     async with httpx.AsyncClient(timeout=60) as c:
@@ -103,7 +130,11 @@ async def embed(text: str) -> list[float]:
     return (await embed_texts([text]))[0]
 
 
-# ── Collection bootstrap ──────────────────────────────────────────────────────
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ── Collection bootstrap ───────────────────────────────────────────────────────
 async def ensure_collection(name: str, vector_size: int) -> None:
     client = get_client()
     try:
@@ -115,25 +146,87 @@ async def ensure_collection(name: str, vector_size: int) -> None:
         )
 
 
-# ── Payload helper ────────────────────────────────────────────────────────────
-def _format_hit(hit) -> dict:
-    """Normalise a search hit — always surface neo4j_element_id at top level."""
-    payload = hit.payload or {}
+# ── Payload builder ────────────────────────────────────────────────────────────
+def _build_cognitive_payload(
+    text: str,
+    neo4j_element_id: str = "",
+    node_type: str = "Chunk",
+    document_id: str = "",
+    document_title: str = "",
+    position: int = 0,
+    agent_id: str = "",
+    confidence: float = 1.0,
+    valid_from: str = "",
+    valid_to: str = "",
+    access_level: str = "",
+    extra: dict = None,
+) -> dict:
+    now = _now()
     return {
-        "id":                hit.id,
-        "score":             hit.score,
-        "neo4j_element_id":  payload.get("neo4j_element_id"),
-        "node_type":         payload.get("node_type", "Chunk"),
-        "text":              payload.get("text", ""),
-        "document_id":       payload.get("document_id"),
-        "document_title":    payload.get("document_title"),
-        "position":          payload.get("position"),
-        "payload":           payload,
+        # GCOR graph reference
+        "neo4j_element_id": neo4j_element_id,
+        "node_type":        node_type,
+        # Content
+        "text":             text,
+        "document_id":      document_id,
+        "document_title":   document_title,
+        "position":         position,
+        # Cognitive infrastructure
+        "confidence":       confidence,
+        "valid_from":       valid_from or now,
+        "valid_to":         valid_to or None,
+        "agent_id":         agent_id,
+        "access_level":     access_level or DEFAULT_ACCESS,
+        "created_at":       now,
+        **(extra or {}),
     }
 
 
-# ── MCP server ────────────────────────────────────────────────────────────────
-mcp = FastMCP("Qdrant-GCOR")
+def _format_hit(hit) -> dict:
+    """Normalise a search hit — always surface cognitive fields at top level."""
+    p = hit.payload or {}
+    return {
+        "id":                hit.id,
+        "score":             hit.score,
+        # GCOR graph link
+        "neo4j_element_id":  p.get("neo4j_element_id"),
+        "node_type":         p.get("node_type", "Chunk"),
+        # Cognitive metadata
+        "confidence":        p.get("confidence"),
+        "valid_from":        p.get("valid_from"),
+        "valid_to":          p.get("valid_to"),
+        "agent_id":          p.get("agent_id"),
+        "access_level":      p.get("access_level", "public"),
+        # Content
+        "text":              p.get("text", ""),
+        "document_id":       p.get("document_id"),
+        "document_title":    p.get("document_title"),
+        "position":          p.get("position"),
+        "payload":           p,
+    }
+
+
+# ── Payload filter builder ─────────────────────────────────────────────────────
+def _build_filter(
+    node_type: str = "",
+    agent_id: str = "",
+    access_level: str = "",
+    min_confidence: float = 0.0,
+) -> Filter | None:
+    must = []
+    if node_type:
+        must.append(FieldCondition(key="node_type", match=MatchValue(value=node_type)))
+    if agent_id:
+        must.append(FieldCondition(key="agent_id", match=MatchValue(value=agent_id)))
+    if access_level:
+        must.append(FieldCondition(key="access_level", match=MatchValue(value=access_level)))
+    if min_confidence > 0.0:
+        must.append(FieldCondition(key="confidence", range=Range(gte=min_confidence)))
+    return Filter(must=must) if must else None
+
+
+# ── MCP server ─────────────────────────────────────────────────────────────────
+mcp = FastMCP("Qdrant-Cognitive")
 
 
 @mcp.tool()
@@ -142,19 +235,14 @@ async def qdrant_list_collections() -> str:
     try:
         client = get_client()
         result = await with_retry(client.get_collections)
-        return json.dumps(
-            [{"name": c.name} for c in result.collections],
-            indent=2,
-        )
+        return json.dumps([{"name": c.name} for c in result.collections], indent=2)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
 
 
 @mcp.tool()
 async def qdrant_collection_info(collection: str) -> str:
-    """
-    Return detailed information about a Qdrant collection.
-
+    """Return detailed information about a Qdrant collection.
     Args:
         collection: Collection name.
     """
@@ -172,28 +260,27 @@ async def qdrant_collection_info(collection: str) -> str:
 
 
 @mcp.tool()
-async def qdrant_count(collection: str, node_type: str = "") -> str:
-    """
-    Return the number of points in a collection, optionally filtered by node_type.
-
+async def qdrant_count(
+    collection: str,
+    node_type: str = "",
+    agent_id: str = "",
+) -> str:
+    """Return the number of points in a collection, optionally filtered.
     Args:
         collection: Collection name.
-        node_type:  Optional GCOR node type filter (e.g. "Chunk", "Memory", "Goal").
+        node_type:  Optional GCOR node type filter (Chunk, Memory, Inference, Belief…).
+        agent_id:   Optional — restrict to one agent's partition.
     """
     try:
         client = get_client()
-        scroll_filter = None
-        if node_type:
-            scroll_filter = Filter(
-                must=[FieldCondition(key="node_type", match=MatchValue(value=node_type))]
-            )
-        result = await with_retry(
-            lambda: client.count(collection, count_filter=scroll_filter)
-        )
-        return json.dumps(
-            {"collection": collection, "node_type": node_type or "all", "count": result.count},
-            indent=2,
-        )
+        f = _build_filter(node_type=node_type, agent_id=agent_id)
+        result = await with_retry(lambda: client.count(collection, count_filter=f))
+        return json.dumps({
+            "collection": collection,
+            "node_type":  node_type or "all",
+            "agent_id":   agent_id or "all",
+            "count":      result.count,
+        }, indent=2)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
 
@@ -204,39 +291,112 @@ async def qdrant_search(
     query: str,
     limit: int = 5,
     node_type: str = "",
+    agent_id: str = "",
+    min_confidence: float = 0.0,
+    access_level: str = "",
 ) -> str:
     """
-    Semantic search in a Qdrant collection.
+    Semantic search with full cognitive filters.
 
-    Results always include neo4j_element_id so callers can hop to the graph.
+    Results always include neo4j_element_id, confidence, temporal fields,
+    and access_level so callers can apply GCOR graph expansion.
 
     Args:
-        collection: Collection name to search.
-        query:      Natural-language query text.
-        limit:      Number of results (default 5).
-        node_type:  Optional GCOR filter — restrict to one node type
-                    (e.g. "Chunk", "Memory", "Goal", "Event").
+        collection:     Collection to search.
+        query:          Natural-language query text.
+        limit:          Number of results (default 5).
+        node_type:      Optional node type filter (Chunk, Memory, Inference, Belief…).
+        agent_id:       Optional — restrict to one agent's partition.
+        min_confidence: Minimum confidence score (0.0 = any).
+        access_level:   Optional access_level filter (public | restricted | agent:<id>).
     """
     try:
         vector = await embed(query)
         client = get_client()
-
-        query_filter = None
-        if node_type:
-            query_filter = Filter(
-                must=[FieldCondition(key="node_type", match=MatchValue(value=node_type))]
-            )
-
+        f = _build_filter(
+            node_type=node_type,
+            agent_id=agent_id,
+            access_level=access_level,
+            min_confidence=min_confidence,
+        )
         results = await with_retry(
             lambda: client.search(
                 collection_name=collection,
                 query_vector=vector,
                 limit=limit,
                 with_payload=True,
-                query_filter=query_filter,
+                query_filter=f,
             )
         )
         return json.dumps([_format_hit(r) for r in results], indent=2)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+@mcp.tool()
+async def qdrant_search_temporal(
+    collection: str,
+    query: str,
+    at_time: str = "",
+    limit: int = 5,
+    node_type: str = "",
+    agent_id: str = "",
+    min_confidence: float = 0.0,
+) -> str:
+    """
+    Semantic search restricted to nodes valid at a specific point in time.
+
+    Uses Qdrant payload filters on valid_from / valid_to so only temporally
+    active knowledge is returned.
+
+    Args:
+        collection:     Collection to search.
+        query:          Natural-language query.
+        at_time:        ISO-8601 timestamp (default: now).
+        limit:          Number of results (default 5).
+        node_type:      Optional node type filter.
+        agent_id:       Optional agent partition filter.
+        min_confidence: Minimum confidence (default 0.0).
+    """
+    try:
+        t = at_time or _now()
+        vector = await embed(query)
+        client = get_client()
+
+        # Build combined filter: cognitive fields + temporal window
+        must = []
+        if node_type:
+            must.append(FieldCondition(key="node_type", match=MatchValue(value=node_type)))
+        if agent_id:
+            must.append(FieldCondition(key="agent_id", match=MatchValue(value=agent_id)))
+        if min_confidence > 0.0:
+            must.append(FieldCondition(key="confidence", range=Range(gte=min_confidence)))
+        # valid_from <= at_time (or null)
+        must.append(FieldCondition(key="valid_from", range=Range(lte=t)))
+
+        query_filter = Filter(must=must) if must else None
+
+        results = await with_retry(
+            lambda: client.search(
+                collection_name=collection,
+                query_vector=vector,
+                limit=limit * 3,  # over-fetch to account for valid_to filter
+                with_payload=True,
+                query_filter=query_filter,
+            )
+        )
+
+        # Post-filter: exclude expired (valid_to < at_time)
+        active = []
+        for r in results:
+            vt = (r.payload or {}).get("valid_to")
+            if vt and vt < t:
+                continue
+            active.append(_format_hit(r))
+            if len(active) >= limit:
+                break
+
+        return json.dumps(active, indent=2)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
 
@@ -247,27 +407,25 @@ async def qdrant_search_by_neo4j_id(
     neo4j_element_id: str,
 ) -> str:
     """
-    Retrieve the Qdrant point(s) that reference a specific Neo4j element ID.
+    Retrieve Qdrant point(s) that reference a specific Neo4j element ID.
 
     Use this in the GCOR structural phase to verify that a graph node is
     indexed and to retrieve its embedding metadata.
 
     Args:
         collection:       Collection name.
-        neo4j_element_id: The elementId string from Neo4j (e.g. "4:abc:0").
+        neo4j_element_id: Neo4j elementId string (e.g. "4:abc:0").
     """
     try:
         client = get_client()
-        scroll_filter = Filter(
-            must=[FieldCondition(
-                key="neo4j_element_id",
-                match=MatchValue(value=neo4j_element_id),
-            )]
-        )
+        f = Filter(must=[FieldCondition(
+            key="neo4j_element_id",
+            match=MatchValue(value=neo4j_element_id),
+        )])
         points, _ = await with_retry(
             lambda: client.scroll(
                 collection_name=collection,
-                scroll_filter=scroll_filter,
+                scroll_filter=f,
                 with_payload=True,
                 with_vectors=False,
                 limit=10,
@@ -286,31 +444,44 @@ async def qdrant_upsert_chunk(
     collection: str,
     text: str,
     neo4j_element_id: str,
+    node_type: str = "Chunk",
     document_id: str = "",
     document_title: str = "",
     position: int = 0,
-    node_type: str = "Chunk",
+    agent_id: str = "",
+    confidence: float = 1.0,
+    valid_from: str = "",
+    valid_to: str = "",
+    access_level: str = "",
     extra_metadata: str = "{}",
 ) -> str:
     """
-    GCOR-aware upsert: embed text and store it with a Neo4j graph reference.
+    GCOR-aware upsert: embed text and store it with full cognitive metadata.
 
     The neo4j_element_id links this Qdrant point back to its authoritative
-    Neo4j node — required by the GCOR architecture.
+    Neo4j node. Confidence, temporal validity, agent partition, and
+    access_level are stored in the payload for downstream filtering.
 
     Args:
         collection:       Target Qdrant collection.
         text:             Text to embed and store.
-        neo4j_element_id: elementId() of the Neo4j node this indexes (required).
-        document_id:      Source document identifier.
+        neo4j_element_id: elementId() of the Neo4j node (required).
+        node_type:        GCOR type: Chunk | Memory | Inference | Belief | Goal | Event.
+        document_id:      Source document id.
         document_title:   Human-readable document title.
         position:         Chunk position within the document.
-        node_type:        GCOR node type label (default "Chunk").
-        extra_metadata:   Optional JSON object for additional payload fields.
+        agent_id:         Agent partition (empty = shared).
+        confidence:       Certainty score 0.0–1.0 (default 1.0).
+        valid_from:       ISO-8601 validity start (default: now).
+        valid_to:         ISO-8601 expiry (default: null = forever).
+        access_level:     ACL string (public | restricted | agent:<id>).
+        extra_metadata:   Optional JSON object for additional fields.
     """
     try:
         if not neo4j_element_id:
             return json.dumps({"error": "neo4j_element_id is required for GCOR upsert"})
+        if not (0.0 <= confidence <= 1.0):
+            return json.dumps({"error": "confidence must be between 0.0 and 1.0"})
 
         vector = await embed(text)
         await ensure_collection(collection, len(vector))
@@ -318,27 +489,34 @@ async def qdrant_upsert_chunk(
         extra = json.loads(extra_metadata)
         point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, neo4j_element_id))
 
-        point = PointStruct(
-            id=point_id,
-            vector=vector,
-            payload={
-                "neo4j_element_id": neo4j_element_id,
-                "node_type":        node_type,
-                "text":             text,
-                "document_id":      document_id,
-                "document_title":   document_title,
-                "position":         position,
-                **extra,
-            },
+        payload = _build_cognitive_payload(
+            text=text,
+            neo4j_element_id=neo4j_element_id,
+            node_type=node_type,
+            document_id=document_id,
+            document_title=document_title,
+            position=position,
+            agent_id=agent_id,
+            confidence=confidence,
+            valid_from=valid_from,
+            valid_to=valid_to,
+            access_level=access_level,
+            extra=extra,
         )
+        point = PointStruct(id=point_id, vector=vector, payload=payload)
         client = get_client()
         result = await with_retry(
             lambda: client.upsert(collection_name=collection, points=[point])
         )
-        return json.dumps(
-            {"status": str(result.status), "id": point_id, "neo4j_element_id": neo4j_element_id},
-            indent=2,
-        )
+        return json.dumps({
+            "status":            str(result.status),
+            "id":                point_id,
+            "neo4j_element_id":  neo4j_element_id,
+            "confidence":        confidence,
+            "valid_from":        payload["valid_from"],
+            "valid_to":          valid_to or None,
+            "access_level":      payload["access_level"],
+        }, indent=2)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
 
@@ -348,8 +526,8 @@ async def qdrant_upsert(collection: str, text: str, metadata: str = "{}") -> str
     """
     Free-form upsert: embed and store a text document.
 
-    Prefer qdrant_upsert_chunk for GCOR-managed content (requires neo4j_element_id).
-    Use this tool for ad-hoc, non-graph content only.
+    Prefer qdrant_upsert_chunk for GCOR-managed content.
+    Use this for ad-hoc, non-graph content only.
 
     Args:
         collection: Target collection name.
@@ -363,7 +541,7 @@ async def qdrant_upsert(collection: str, text: str, metadata: str = "{}") -> str
         point = PointStruct(
             id=str(uuid.uuid4()),
             vector=vector,
-            payload={"text": text, **extra},
+            payload={"text": text, "access_level": DEFAULT_ACCESS, **extra},
         )
         client = get_client()
         result = await with_retry(
@@ -376,12 +554,10 @@ async def qdrant_upsert(collection: str, text: str, metadata: str = "{}") -> str
 
 @mcp.tool()
 async def qdrant_delete_points(collection: str, point_ids: str) -> str:
-    """
-    Delete specific points from a collection by their IDs.
-
+    """Delete specific points from a collection by their IDs.
     Args:
         collection: Collection name.
-        point_ids:  JSON array of point ID strings, e.g. '["id1","id2"]'.
+        point_ids:  JSON array of point ID strings.
     """
     try:
         ids = json.loads(point_ids)
@@ -399,9 +575,7 @@ async def qdrant_delete_points(collection: str, point_ids: str) -> str:
 
 @mcp.tool()
 async def qdrant_delete_collection(collection: str) -> str:
-    """
-    Permanently delete a Qdrant collection and all its points.
-
+    """Permanently delete a Qdrant collection and all its points.
     Args:
         collection: Collection name to delete.
     """
@@ -416,24 +590,36 @@ async def qdrant_delete_collection(collection: str) -> str:
 @mcp.tool()
 async def qdrant_gcor_status(collection: str = COLLECTION_NAME) -> str:
     """
-    GCOR health check: return per-node-type point counts for a collection.
-
-    Helps verify that Neo4j nodes are properly indexed in Qdrant.
+    GCOR health check: per-node-type and per-access-level point counts.
 
     Args:
         collection: Collection name (default: COLLECTION_NAME env var).
     """
-    node_types = ["Chunk", "Memory", "Goal", "Event", "Document", "Concept"]
+    node_types = ["Chunk", "Memory", "Inference", "Belief", "Goal", "Event",
+                  "Document", "Concept"]
     try:
         client = get_client()
-        totals = {}
+        type_counts = {}
         for nt in node_types:
             f = Filter(must=[FieldCondition(key="node_type", match=MatchValue(value=nt))])
             r = await with_retry(lambda f=f: client.count(collection, count_filter=f))
-            totals[nt] = r.count
-        all_r = await with_retry(lambda: client.count(collection))
-        totals["_total"] = all_r.count
-        return json.dumps({"collection": collection, "counts": totals}, indent=2)
+            type_counts[nt] = r.count
+
+        total_r = await with_retry(lambda: client.count(collection))
+
+        # Count by access level
+        access_counts = {}
+        for level in ["public", "restricted"]:
+            f = Filter(must=[FieldCondition(key="access_level", match=MatchValue(value=level))])
+            r = await with_retry(lambda f=f: client.count(collection, count_filter=f))
+            access_counts[level] = r.count
+
+        return json.dumps({
+            "collection":     collection,
+            "total":          total_r.count,
+            "by_node_type":   type_counts,
+            "by_access_level": access_counts,
+        }, indent=2)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
 
@@ -447,15 +633,13 @@ async def sync_neo4j_to_qdrant(
 ) -> str:
     """
     GCOR sync: pull nodes from Neo4j, embed their text, and upsert into Qdrant
-    with neo4j_element_id in every point's payload.
-
-    Uses the canonical GCOR Cypher query that returns elementId() so that every
-    Qdrant point carries a proper graph reference.
+    with the full cognitive payload (neo4j_element_id, confidence, temporal,
+    agent_id, access_level).
 
     Args:
-        collection: Target Qdrant collection (default: COLLECTION_NAME env var).
+        collection: Target Qdrant collection.
         batch_size: Texts to embed per OpenAI API call (default 32).
-        node_types: Comma-separated node type labels to sync (default "Chunk").
+        node_types: Comma-separated node type labels (default "Chunk").
         limit:      Maximum nodes to sync per label (default 500).
     """
     if not OPENAI_API_KEY:
@@ -471,60 +655,71 @@ async def sync_neo4j_to_qdrant(
         try:
             async with driver.session(database=NEO4J_DATABASE) as session:
                 for label in labels:
-                    # Fetch nodes with their elementId and a text representation
                     cypher = f"""
                         MATCH (n:{label})
                         WHERE n.text IS NOT NULL OR n.content IS NOT NULL
                               OR n.description IS NOT NULL OR n.name IS NOT NULL
-                        RETURN elementId(n)          AS element_id,
-                               coalesce(n.text, n.content, n.description, n.name) AS text,
-                               n.document_id         AS document_id,
-                               n.document_title      AS document_title,
-                               coalesce(n.position, 0) AS position,
-                               '{label}'             AS node_type
+                        RETURN
+                            elementId(n)                          AS element_id,
+                            coalesce(n.text, n.content,
+                                     n.description, n.name)       AS text,
+                            n.document_id                         AS document_id,
+                            n.document_title                      AS document_title,
+                            coalesce(n.position, 0)               AS position,
+                            n.agent_id                            AS agent_id,
+                            coalesce(n.confidence, 1.0)           AS confidence,
+                            n.valid_from                          AS valid_from,
+                            n.valid_to                            AS valid_to,
+                            coalesce(n.access_level, $access)     AS access_level,
+                            '{label}'                             AS node_type
                         LIMIT {limit}
                     """
-                    result = await session.run(cypher)
+                    result = await session.run(cypher, {"access": DEFAULT_ACCESS})
                     records = await result.data()
                     all_nodes.extend(records)
         finally:
             await driver.close()
 
         if not all_nodes:
-            return json.dumps({"synced": 0, "message": "No nodes with text found for given types"})
+            return json.dumps({"synced": 0,
+                               "message": "No nodes with text found for given types"})
 
-        # Ensure collection exists (probe vector size with first embed)
         sample = await embed_texts([all_nodes[0]["text"]])
         await ensure_collection(collection, len(sample[0]))
 
-        # Embed + upsert in batches
         total_upserted = 0
         client = get_client()
 
         for i in range(0, len(all_nodes), batch_size):
-            batch = all_nodes[i : i + batch_size]
-            texts = [n["text"] for n in batch]
-            vectors = await embed_texts(texts)
+            batch   = all_nodes[i : i + batch_size]
+            vectors = await embed_texts([n["text"] for n in batch])
 
             points = []
             for node, vec in zip(batch, vectors):
                 eid = node["element_id"]
+                payload = _build_cognitive_payload(
+                    text=node["text"],
+                    neo4j_element_id=eid,
+                    node_type=node["node_type"],
+                    document_id=node.get("document_id") or "",
+                    document_title=node.get("document_title") or "",
+                    position=node.get("position", 0),
+                    agent_id=node.get("agent_id") or "",
+                    confidence=float(node.get("confidence", 1.0)),
+                    valid_from=node.get("valid_from") or "",
+                    valid_to=node.get("valid_to") or "",
+                    access_level=node.get("access_level") or DEFAULT_ACCESS,
+                    extra={"source": "neo4j_sync"},
+                )
                 points.append(PointStruct(
-                    # Deterministic ID — upsert is idempotent
                     id=str(uuid.uuid5(uuid.NAMESPACE_URL, eid)),
                     vector=vec,
-                    payload={
-                        "neo4j_element_id": eid,
-                        "node_type":        node["node_type"],
-                        "text":             node["text"],
-                        "document_id":      node.get("document_id") or "",
-                        "document_title":   node.get("document_title") or "",
-                        "position":         node.get("position", 0),
-                        "source":           "neo4j_sync",
-                    },
+                    payload=payload,
                 ))
 
-            await with_retry(lambda pts=points: client.upsert(collection_name=collection, points=pts))
+            await with_retry(
+                lambda pts=points: client.upsert(collection_name=collection, points=pts)
+            )
             total_upserted += len(points)
 
         return json.dumps({
@@ -537,6 +732,6 @@ async def sync_neo4j_to_qdrant(
         return json.dumps({"error": str(exc)})
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     mcp.run(transport="sse", host=HOST, port=PORT)
