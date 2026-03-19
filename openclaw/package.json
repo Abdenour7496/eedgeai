@@ -1,0 +1,10 @@
+{
+  "name": "openclaw-drivers",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Neo4j and Qdrant driver layer for OpenClaw",
+  "dependencies": {
+    "neo4j-driver": "^5.27.0",
+    "@qdrant/js-client-rest": "^1.13.0"
+  }
+}

@@ -28,18 +28,31 @@ services:
       timeout: 5s
       retries: 5
 
-  # MCP server: exposes Qdrant to OpenClaw via the Model Context Protocol
+  # MCP server: exposes Qdrant to OpenClaw via the Model Context Protocol.
+  # Uses the official qdrant-client SDK with retry logic.
+  # Also provides sync_neo4j_to_qdrant for cross-DB orchestration.
   mcp-qdrant:
     build: ./mcp-servers/qdrant
     environment:
       QDRANT_URL: http://quarant:6333
-      COLLECTION_NAME: documents
+      COLLECTION_NAME: ${QDRANT_COLLECTION:-documents}
+      QDRANT_MCP_HOST: 0.0.0.0
+      QDRANT_MCP_PORT: "8765"
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+      # Needed by sync_neo4j_to_qdrant tool
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: test1234
     depends_on:
       quarant:
         condition: service_healthy
+      neo4j:
+        condition: service_healthy
     restart: unless-stopped
 
-  # MCP server: exposes Neo4j to OpenClaw via the Model Context Protocol
+  # MCP server: exposes Neo4j to OpenClaw via the Model Context Protocol.
+  # Uses the official neo4j async driver with connection pooling and retry.
   mcp-neo4j:
     build: ./mcp-servers/neo4j
     environment:
@@ -55,7 +68,9 @@ services:
     restart: unless-stopped
 
   openclaw:
-    image: ghcr.io/openclaw/openclaw:latest
+    # Custom build: extends the official image with the neo4j-driver and
+    # @qdrant/js-client-rest Node.js packages + CLI tool scripts.
+    build: ./openclaw
     depends_on:
       - mcp-qdrant
       - mcp-neo4j
@@ -73,6 +88,13 @@ services:
       OPENCLAW_CONFIG_DIR: /home/node/.openclaw
       OPENCLAW_WORKSPACE_DIR: /home/node/.openclaw/workspace
       OPENCLAW_DOCKER_APT_PACKAGES: ${OPENCLAW_DOCKER_APT_PACKAGES:-}
+      # Passed to neo4j-cli and qdrant-cli driver scripts
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: test1234
+      QDRANT_URL: http://quarant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-documents}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
     volumes:
       - ${OPENCLAW_CONFIG_DIR:-openclaw_config}:/home/node/.openclaw
       # Bind-mount the MCP server config so OpenClaw discovers Qdrant + Neo4j
