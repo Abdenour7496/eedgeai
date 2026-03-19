@@ -9,28 +9,37 @@ A unified AI agent stack combining graph database (Neo4j), vector search (Qdrant
 ```
 User
  └─► Open WebUI (port 8080)
-       └─► Proxy / OpenAI Bridge (port 5001)
-             └─► OpenClaw Relay (port 18799 → 18789)
-                   └─► OpenClaw Agent (internal ports 18789/18790)
-                         ├─► MCP Server: Neo4j  (port 8766) ──► Neo4j Graph DB (port 7687)
-                         └─► MCP Server: Qdrant (port 8765) ──► Qdrant Vector DB (port 6333)
+       └─► Proxy / RAG Pipeline (port 5001)
+             ├─► Qdrant (port 6333)      ← semantic search for context
+             ├─► Neo4j (port 7687)       ← knowledge graph for context
+             └─► LLM API (OpenAI / Anthropic) ← answers with injected context
+
+OpenClaw Agent (ports 18799 / 18801)   ← standalone agent interface (separate from OpenWebUI)
+ ├─► MCP Server: Neo4j  (port 8766) ──► Neo4j (port 7687)
+ └─► MCP Server: Qdrant (port 8765) ──► Qdrant (port 6333)
 
 Monitoring
- ├─► Prometheus (port 9090)  — scrapes proxy, neo4j, openclaw, qdrant
- └─► Grafana (port 3000)     — auto-provisioned dashboard + Prometheus datasource
+ ├─► Prometheus (port 9090)
+ └─► Grafana (port 3000)
 ```
 
-### How OpenClaw talks to Neo4j and Qdrant
+### How OpenWebUI gets RAG context (proxy pipeline)
 
-OpenClaw does **not** connect to databases via raw environment variables. Instead it uses the
-[Model Context Protocol (MCP)](https://modelcontextprotocol.io) — two lightweight sidecar services
-(`mcp-qdrant` and `mcp-neo4j`) expose Qdrant and Neo4j as MCP tool servers over SSE. The file
-[`openclaw-config/openclaw.json`](openclaw-config/openclaw.json) tells OpenClaw where to find them.
+The proxy at port 5001 is the core RAG engine for OpenWebUI:
 
-```
-openclaw ──(SSE)──► mcp-qdrant:8765  ──► qdrant:6333
-         └─(SSE)──► mcp-neo4j:8766  ──► neo4j:7687
-```
+1. **Embed** — the user's message is embedded using `text-embedding-3-small` (OpenAI)
+2. **Qdrant search** — the proxy queries Qdrant for the top-k most similar document chunks
+3. **Neo4j search** — the proxy queries Neo4j for nodes whose properties match the query keywords
+4. **Context injection** — retrieved chunks and graph nodes are prepended as a system message
+5. **LLM call** — the enriched request is forwarded to OpenAI or Anthropic and the response is streamed back
+
+The proxy also handles `/v1/embeddings` so OpenWebUI's own built-in RAG (for uploaded documents) works correctly.
+
+### OpenClaw (separate agent interface)
+
+OpenClaw is a standalone AI coding assistant. It connects to Neo4j and Qdrant through MCP sidecar
+services (`mcp-qdrant`, `mcp-neo4j`). Its web interface is available at `http://localhost:18801`.
+It operates independently of OpenWebUI.
 
 ---
 
@@ -129,18 +138,18 @@ docker compose -f docker-compose.unified.yml ps
 
 All 10 services should show `Up` or `healthy`:
 
-| Service         | Port          | Description                              |
-|-----------------|---------------|------------------------------------------|
-| openwebui       | 8080          | Chat UI                                  |
-| proxy           | 5001          | OpenAI-compatible API bridge             |
-| openclaw        | 18799, 18801  | AI agent (connects to DBs via MCP)       |
-| openclaw-relay  | (shared)      | TCP relay (18799→18789, 18801→18790)     |
-| mcp-qdrant      | 8765 (internal) | MCP server — exposes Qdrant to OpenClaw |
-| mcp-neo4j       | 8766 (internal) | MCP server — exposes Neo4j to OpenClaw  |
-| neo4j           | 7474, 7687    | Graph database                           |
-| quarant         | 6333          | Qdrant vector database                   |
-| prometheus      | 9090          | Metrics collection                       |
-| grafana         | 3000          | Metrics dashboard                        |
+| Service         | Port            | Description                                        |
+|-----------------|-----------------|----------------------------------------------------|
+| openwebui       | 8080            | Chat UI                                            |
+| proxy           | 5001            | RAG pipeline — embeds, retrieves, calls LLM        |
+| openclaw        | 18799, 18801    | Standalone AI agent (its own chat interface)       |
+| openclaw-relay  | (shared)        | TCP relay (18799→18789, 18801→18790)               |
+| mcp-qdrant      | 8765 (internal) | MCP server — exposes Qdrant to OpenClaw agent      |
+| mcp-neo4j       | 8766 (internal) | MCP server — exposes Neo4j to OpenClaw agent       |
+| neo4j           | 7474, 7687      | Graph database                                     |
+| quarant         | 6333            | Qdrant vector database                             |
+| prometheus      | 9090            | Metrics collection                                 |
+| grafana         | 3000            | Metrics dashboard                                  |
 
 ---
 
@@ -316,18 +325,32 @@ Neo4j can take 30–60 seconds to fully initialise. The stack uses health checks
 - Confirm Prometheus is up: `http://localhost:9090/targets`
 - All targets should show `UP`. If a target is down, check that the relevant container is running.
 
-**OpenClaw can't query Neo4j or Qdrant:**
+**OpenWebUI chat has no RAG context (answers don't use Neo4j / Qdrant data):**
 
-OpenClaw connects to these databases via MCP (Model Context Protocol), not directly. Check the MCP sidecar services first:
+The proxy handles RAG automatically — each chat message triggers an embed + Qdrant search + Neo4j lookup before calling the LLM. Check the proxy logs to see what's happening:
+```bash
+docker compose -f docker-compose.unified.yml logs proxy
+```
+You should see lines like:
+```
+INFO: Qdrant: 5 chunk(s) retrieved
+INFO: Neo4j:  2 node(s) retrieved
+```
+If Qdrant returns 0 chunks, the collection is likely empty — run the ingestion script first (see Step 6).
+If Neo4j returns 0 nodes, the graph is empty — add data via the Neo4j browser at `http://localhost:7474`.
+To disable RAG temporarily (answer without context), set `ENABLE_RAG=false` in `.env` and restart the proxy.
+
+**OpenClaw can't query Neo4j or Qdrant (OpenClaw's own interface):**
+
+OpenClaw uses MCP sidecar services for its native interface. Check them:
 ```bash
 docker compose -f docker-compose.unified.yml logs mcp-qdrant
 docker compose -f docker-compose.unified.yml logs mcp-neo4j
 ```
-Both should show an SSE server started on `0.0.0.0`. If either failed to start, the likely cause is that the database wasn't healthy yet — restart with:
+If they failed to start, restart them:
 ```bash
 docker compose -f docker-compose.unified.yml restart mcp-qdrant mcp-neo4j
 ```
-The MCP configuration that wires everything together is in [`openclaw-config/openclaw.json`](openclaw-config/openclaw.json). It is bind-mounted read-only into the OpenClaw container at `/home/node/.openclaw/openclaw.json`.
 
 **Ingestion script fails:**
 - Ensure required pip packages are installed (`openai`, `httpx`, `pyyaml`, or `sentence-transformers` depending on the model).
