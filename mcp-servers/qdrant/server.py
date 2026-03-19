@@ -226,7 +226,7 @@ def _build_filter(
 
 
 # ── MCP server ─────────────────────────────────────────────────────────────────
-mcp = FastMCP("Qdrant-Cognitive")
+mcp = FastMCP("Qdrant-Cognitive", host=HOST, port=PORT)
 
 
 @mcp.tool()
@@ -734,4 +734,4 @@ async def sync_neo4j_to_qdrant(
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    mcp.run(transport="sse", host=HOST, port=PORT)
+    mcp.run(transport="sse")

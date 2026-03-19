@@ -15,5 +15,7 @@ RUN chmod +x neo4j.js qdrant.js && \
     ln -s /opt/oc-drivers/neo4j.js /usr/local/bin/neo4j-cli && \
     ln -s /opt/oc-drivers/qdrant.js /usr/local/bin/qdrant-cli
 
+# Reset WORKDIR to /app so the base CMD ("node openclaw.mjs ...") still resolves
+# the relative path correctly.
+WORKDIR /app
 USER node
-WORKDIR /home/node

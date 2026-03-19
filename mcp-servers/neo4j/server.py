@@ -123,7 +123,7 @@ def _now() -> str:
 
 
 # ── MCP server ─────────────────────────────────────────────────────────────────
-mcp = FastMCP("Neo4j-Cognitive")
+mcp = FastMCP("Neo4j-Cognitive", host=HOST, port=PORT)
 
 
 # ── Core query tools ───────────────────────────────────────────────────────────
@@ -1037,4 +1037,4 @@ async def neo4j_access_check(element_id: str, agent_id: str) -> str:
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    mcp.run(transport="sse", host=HOST, port=PORT)
+    mcp.run(transport="sse")

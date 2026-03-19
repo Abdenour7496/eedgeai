@@ -1,12 +1,1 @@
-{
-  "mcpServers": {
-    "qdrant": {
-      "type": "remote",
-      "url": "http://mcp-qdrant:8765/sse"
-    },
-    "neo4j": {
-      "type": "remote",
-      "url": "http://mcp-neo4j:8766/sse"
-    }
-  }
-}
+{}
