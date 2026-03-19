@@ -1,0 +1,9 @@
+
+# Basic Prometheus config
+scrape_configs:
+  - job_name: 'neo4j'
+    static_configs:
+      - targets: ['neo4j:2004']
+  - job_name: 'openclaw'
+    static_configs:
+      - targets: ['openclaw:9091']

@@ -1,0 +1,11 @@
+
+models:
+  openai_large:
+    provider: openai
+    model: text-embedding-3-large
+  all_minilm:
+    provider: local
+    model: all-MiniLM-L6-v2
+  codebert:
+    provider: local
+    model: codebert-base

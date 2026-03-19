@@ -1,0 +1,36 @@
+
+agents:
+  router_agent:
+    type: router
+    description: Routes queries to semantic or graph retrievers.
+
+  retriever_agent:
+    type: retriever
+    tools:
+      - semantic_search_quarant
+      - query_neo4j
+
+  kg_writer_agent:
+    type: writer
+    tools:
+      - write_neo4j
+
+embedding_models:
+  openai_large:
+    type: openai
+    model: text-embedding-3-large
+  openai_small:
+    type: openai
+    model: text-embedding-3-small
+  sentence_transformer:
+    type: local
+    model: all-MiniLM-L6-v2
+  code_embedding:
+    type: local
+    model: codebert-base
+  azure_openai:
+    type: azure
+    endpoint: https://example-endpoint
+    deployment: embeddings
+    model: text-embedding-3-large
+active_model: openai_large

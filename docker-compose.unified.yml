@@ -1,0 +1,149 @@
+version: "3.9"
+
+services:
+  neo4j:
+    image: neo4j:5
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/test1234
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:7474"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  quarant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - quarant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:6333/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # MCP server: exposes Qdrant to OpenClaw via the Model Context Protocol
+  mcp-qdrant:
+    build: ./mcp-servers/qdrant
+    environment:
+      QDRANT_URL: http://quarant:6333
+      COLLECTION_NAME: documents
+    depends_on:
+      quarant:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # MCP server: exposes Neo4j to OpenClaw via the Model Context Protocol
+  mcp-neo4j:
+    build: ./mcp-servers/neo4j
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USERNAME: neo4j
+      NEO4J_PASSWORD: test1234
+      NEO4J_DATABASE: neo4j
+      NEO4J_MCP_SERVER_HOST: 0.0.0.0
+      NEO4J_MCP_SERVER_PORT: "8766"
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    restart: unless-stopped
+
+  openclaw:
+    image: ghcr.io/openclaw/openclaw:latest
+    depends_on:
+      - mcp-qdrant
+      - mcp-neo4j
+    ports:
+      - "18799:18799"
+      - "18801:18801"
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENCLAW_GATEWAY_PORT: ${OPENCLAW_GATEWAY_PORT:-18789}
+      OPENCLAW_BRIDGE_PORT: ${OPENCLAW_BRIDGE_PORT:-18790}
+      OPENCLAW_GATEWAY_BIND: ${OPENCLAW_GATEWAY_BIND:-lan}
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+      OPENCLAW_GATEWAY_PASSWORD: ${OPENCLAW_GATEWAY_PASSWORD}
+      OPENCLAW_CONFIG_DIR: /home/node/.openclaw
+      OPENCLAW_WORKSPACE_DIR: /home/node/.openclaw/workspace
+      OPENCLAW_DOCKER_APT_PACKAGES: ${OPENCLAW_DOCKER_APT_PACKAGES:-}
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR:-openclaw_config}:/home/node/.openclaw
+      # Bind-mount the MCP server config so OpenClaw discovers Qdrant + Neo4j
+      - ./openclaw-config/openclaw.json:/home/node/.openclaw/openclaw.json:ro
+
+  openclaw-relay:
+    image: ghcr.io/openclaw/openclaw:latest
+    network_mode: "service:openclaw"
+    depends_on:
+      - openclaw
+    entrypoint: node
+    command: /relay/relay.js
+    volumes:
+      - ./openclaw-relay:/relay
+    restart: unless-stopped
+
+  proxy:
+    build: ./proxy
+    ports:
+      - "5001:5001"
+    depends_on:
+      - openclaw
+      - openclaw-relay
+    environment:
+      OPENCLAW_URL: http://openclaw:18799
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      OPENAI_API_BASE_URL: http://proxy:5001/v1
+      OPENAI_API_KEY: openclaw
+      RAG_EMBEDDING_ENGINE: openai
+      RAG_OPENAI_API_BASE_URL: http://proxy:5001/v1
+      RAG_OPENAI_API_KEY: openclaw
+      ENABLE_RAG_LOCAL_WEB_FETCH: "false"
+      RESET_CONFIG_ON_START: "true"
+    volumes:
+      - openwebui_data:/app/backend/data
+    depends_on:
+      proxy:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+    volumes:
+      - ./monitoring/grafana-dashboard.json:/var/lib/grafana/dashboards/dashboard.json
+      - ./monitoring/grafana-provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+
+volumes:
+  neo4j_data:
+  quarant_data:
+  openclaw_config:
+  openwebui_data:

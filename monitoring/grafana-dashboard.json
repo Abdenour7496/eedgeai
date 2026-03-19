@@ -1,0 +1,128 @@
+{
+  "dashboard": {
+    "title": "Agent System Metrics",
+    "uid": "eedgeai-main",
+    "schemaVersion": 36,
+    "refresh": "10s",
+    "panels": [
+      {
+        "id": 1,
+        "type": "stat",
+        "title": "Proxy Up",
+        "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+        "targets": [
+          {
+            "expr": "up{job=\"proxy\"}",
+            "legendFormat": "proxy"
+          }
+        ],
+        "options": {
+          "reduceOptions": { "calcs": ["lastNotNull"] },
+          "colorMode": "background",
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": 0 },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "datasource": "Prometheus"
+      },
+      {
+        "id": 2,
+        "type": "stat",
+        "title": "Neo4j Up",
+        "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+        "targets": [
+          {
+            "expr": "up{job=\"neo4j\"}",
+            "legendFormat": "neo4j"
+          }
+        ],
+        "options": {
+          "reduceOptions": { "calcs": ["lastNotNull"] },
+          "colorMode": "background",
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": 0 },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "datasource": "Prometheus"
+      },
+      {
+        "id": 3,
+        "type": "stat",
+        "title": "OpenClaw Up",
+        "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+        "targets": [
+          {
+            "expr": "up{job=\"openclaw\"}",
+            "legendFormat": "openclaw"
+          }
+        ],
+        "options": {
+          "reduceOptions": { "calcs": ["lastNotNull"] },
+          "colorMode": "background",
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": 0 },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "datasource": "Prometheus"
+      },
+      {
+        "id": 4,
+        "type": "stat",
+        "title": "Qdrant Up",
+        "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
+        "targets": [
+          {
+            "expr": "up{job=\"qdrant\"}",
+            "legendFormat": "qdrant"
+          }
+        ],
+        "options": {
+          "reduceOptions": { "calcs": ["lastNotNull"] },
+          "colorMode": "background",
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": 0 },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "datasource": "Prometheus"
+      },
+      {
+        "id": 5,
+        "type": "timeseries",
+        "title": "HTTP Request Rate (proxy)",
+        "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+        "targets": [
+          {
+            "expr": "rate(http_requests_total{job=\"proxy\"}[1m])",
+            "legendFormat": "{{method}} {{path}}"
+          }
+        ],
+        "datasource": "Prometheus"
+      },
+      {
+        "id": 6,
+        "type": "timeseries",
+        "title": "HTTP Error Rate (proxy)",
+        "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+        "targets": [
+          {
+            "expr": "rate(http_requests_total{job=\"proxy\", status=~\"5..\"}[1m])",
+            "legendFormat": "5xx errors"
+          }
+        ],
+        "datasource": "Prometheus"
+      }
+    ]
+  }
+}

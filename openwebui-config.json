@@ -1,0 +1,4 @@
+{
+  "openai_api_base_url": "http://proxy:5001/v1",
+  "openai_api_key": "local"
+}
