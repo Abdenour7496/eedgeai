@@ -16,4 +16,4 @@ scrape_configs:
 
   - job_name: 'qdrant'
     static_configs:
-      - targets: ['quarant:6333']
+      - targets: ['qdrant:6333']
