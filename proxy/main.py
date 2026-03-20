@@ -913,6 +913,299 @@ async def api_collection_docs(name: str):
         await driver.close()
 
 
+@app.post("/api/collections")
+async def api_create_collection(request: Request):
+    """Create a new empty Qdrant collection."""
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    if not name or "/" in name or ".." in name:
+        raise HTTPException(status_code=400, detail="Invalid collection name")
+    vec_size = int(body.get("vector_size", 1536))
+    distance = body.get("distance", "Cosine")
+    async with httpx.AsyncClient(timeout=30) as c:
+        chk = await c.get(f"{QDRANT_URL}/collections/{name}")
+        if chk.status_code == 200:
+            raise HTTPException(status_code=409, detail=f"Collection '{name}' already exists")
+        resp = await c.put(
+            f"{QDRANT_URL}/collections/{name}",
+            json={"vectors": {"size": vec_size, "distance": distance}},
+        )
+        resp.raise_for_status()
+    return {"status": "ok", "name": name}
+
+
+@app.patch("/api/collections/{name}")
+async def api_rename_collection(name: str, request: Request):
+    """Rename a Qdrant collection: create new, scroll-copy all points, delete old."""
+    body = await request.json()
+    new_name = (body.get("name") or "").strip()
+    if not new_name or "/" in new_name or ".." in new_name:
+        raise HTTPException(status_code=400, detail="Invalid collection name")
+    if new_name == name:
+        return {"status": "ok", "name": new_name, "points_copied": 0}
+
+    async with httpx.AsyncClient(timeout=120) as c:
+        info_resp = await c.get(f"{QDRANT_URL}/collections/{name}")
+        if info_resp.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+        vec_params = (info_resp.json().get("result", {})
+                      .get("config", {}).get("params", {}).get("vectors", {}))
+        vec_size = vec_params.get("size", 1536) if isinstance(vec_params, dict) else 1536
+        distance = vec_params.get("distance", "Cosine") if isinstance(vec_params, dict) else "Cosine"
+
+        chk = await c.get(f"{QDRANT_URL}/collections/{new_name}")
+        if chk.status_code == 200:
+            raise HTTPException(status_code=409, detail=f"Collection '{new_name}' already exists")
+
+        cr = await c.put(
+            f"{QDRANT_URL}/collections/{new_name}",
+            json={"vectors": {"size": vec_size, "distance": distance}},
+        )
+        cr.raise_for_status()
+
+        offset = None
+        total = 0
+        while True:
+            scroll_body: dict = {"limit": 100, "with_payload": True, "with_vector": True}
+            if offset is not None:
+                scroll_body["offset"] = offset
+            sr = await c.post(
+                f"{QDRANT_URL}/collections/{name}/points/scroll", json=scroll_body
+            )
+            sr.raise_for_status()
+            result = sr.json().get("result", {})
+            pts = result.get("points", [])
+            if pts:
+                ur = await c.put(
+                    f"{QDRANT_URL}/collections/{new_name}/points",
+                    params={"wait": "true"},
+                    json={"points": pts},
+                )
+                ur.raise_for_status()
+                total += len(pts)
+            offset = result.get("next_page_offset")
+            if offset is None:
+                break
+
+        await c.delete(f"{QDRANT_URL}/collections/{name}")
+
+    return {"status": "ok", "name": new_name, "points_copied": total}
+
+
+@app.delete("/api/collections/{name}")
+async def api_archive_collection(name: str):
+    """Archive a collection: copy to _archived_* in Qdrant, mark Neo4j docs, record in graph."""
+    ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    archive_qname = f"_archived_{name}_{ts_ms}"
+    now = _now_iso()
+    doc_ids: set = set()
+    points_count = 0
+
+    async with httpx.AsyncClient(timeout=120) as c:
+        info_resp = await c.get(f"{QDRANT_URL}/collections/{name}")
+        if info_resp.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+        vec_params = (info_resp.json().get("result", {})
+                      .get("config", {}).get("params", {}).get("vectors", {}))
+        vec_size = vec_params.get("size", 1536) if isinstance(vec_params, dict) else 1536
+        distance = vec_params.get("distance", "Cosine") if isinstance(vec_params, dict) else "Cosine"
+
+        cr = await c.put(
+            f"{QDRANT_URL}/collections/{archive_qname}",
+            json={"vectors": {"size": vec_size, "distance": distance}},
+        )
+        cr.raise_for_status()
+
+        offset = None
+        while True:
+            scroll_body: dict = {"limit": 100, "with_payload": True, "with_vector": True}
+            if offset is not None:
+                scroll_body["offset"] = offset
+            sr = await c.post(
+                f"{QDRANT_URL}/collections/{name}/points/scroll", json=scroll_body
+            )
+            sr.raise_for_status()
+            result = sr.json().get("result", {})
+            pts = result.get("points", [])
+            if pts:
+                for p in pts:
+                    did = (p.get("payload") or {}).get("document_id")
+                    if did:
+                        doc_ids.add(did)
+                ur = await c.put(
+                    f"{QDRANT_URL}/collections/{archive_qname}/points",
+                    params={"wait": "true"}, json={"points": pts},
+                )
+                ur.raise_for_status()
+                points_count += len(pts)
+            offset = result.get("next_page_offset")
+            if offset is None:
+                break
+
+        await c.delete(f"{QDRANT_URL}/collections/{name}")
+
+    doc_ids_list = list(doc_ids)
+    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    try:
+        async with driver.session(database=NEO4J_DATABASE) as s:
+            if doc_ids_list:
+                await s.run(
+                    "UNWIND $ids AS did "
+                    "MATCH (d:Document {document_id: did}) "
+                    "SET d.archived = true, d.archived_at = $now, d.archived_from = $orig",
+                    ids=doc_ids_list, now=now, orig=name,
+                )
+            await s.run(
+                "CREATE (:ArchivedCollection {"
+                "  qdrant_name: $qname, original_name: $oname,"
+                "  archived_at: $now, doc_ids: $doc_ids, points_count: $pc"
+                "})",
+                qname=archive_qname, oname=name, now=now,
+                doc_ids=doc_ids_list, pc=points_count,
+            )
+    except Exception as exc:
+        logger.warning("Neo4j archive metadata failed: %s", exc)
+    finally:
+        await driver.close()
+
+    return {
+        "status":        "archived",
+        "archive_name":  archive_qname,
+        "original_name": name,
+        "points":        points_count,
+        "documents":     len(doc_ids_list),
+    }
+
+
+@app.get("/api/archives")
+async def api_list_archives():
+    """List all archived collections recorded in Neo4j."""
+    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    try:
+        async with driver.session(database=NEO4J_DATABASE) as s:
+            result = await s.run(
+                "MATCH (a:ArchivedCollection) "
+                "RETURN a.qdrant_name AS qdrant_name, a.original_name AS original_name, "
+                "       a.archived_at AS archived_at, a.doc_ids AS doc_ids, "
+                "       a.points_count AS points_count "
+                "ORDER BY a.archived_at DESC"
+            )
+            records = await result.data()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    finally:
+        await driver.close()
+
+    archives = []
+    async with httpx.AsyncClient(timeout=10) as c:
+        for r in records:
+            chk = await c.get(f"{QDRANT_URL}/collections/{r['qdrant_name']}")
+            archives.append({
+                "qdrant_name":   r["qdrant_name"],
+                "original_name": r["original_name"],
+                "archived_at":   r["archived_at"],
+                "points_count":  r["points_count"] or 0,
+                "doc_count":     len(r["doc_ids"] or []),
+                "qdrant_exists": chk.status_code == 200,
+            })
+    return {"archives": archives}
+
+
+@app.post("/api/archives/{archive_name}/restore")
+async def api_restore_archive(archive_name: str, request: Request):
+    """Restore an archived collection to active, with optional rename."""
+    body = await request.json()
+    restore_name = (body.get("name") or "").strip()
+
+    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    try:
+        async with driver.session(database=NEO4J_DATABASE) as s:
+            res = await s.run(
+                "MATCH (a:ArchivedCollection {qdrant_name: $qname}) "
+                "RETURN a.original_name AS original_name, a.doc_ids AS doc_ids",
+                qname=archive_name,
+            )
+            rec = await res.single()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    finally:
+        await driver.close()
+
+    if not rec:
+        raise HTTPException(status_code=404, detail=f"Archive '{archive_name}' not found")
+
+    original_name = rec["original_name"]
+    doc_ids = list(rec["doc_ids"] or [])
+    target_name = restore_name or original_name
+
+    async with httpx.AsyncClient(timeout=120) as c:
+        info_resp = await c.get(f"{QDRANT_URL}/collections/{archive_name}")
+        if info_resp.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"Qdrant archive '{archive_name}' not found")
+        vec_params = (info_resp.json().get("result", {})
+                      .get("config", {}).get("params", {}).get("vectors", {}))
+        vec_size = vec_params.get("size", 1536) if isinstance(vec_params, dict) else 1536
+        distance = vec_params.get("distance", "Cosine") if isinstance(vec_params, dict) else "Cosine"
+
+        chk = await c.get(f"{QDRANT_URL}/collections/{target_name}")
+        if chk.status_code == 200:
+            raise HTTPException(
+                status_code=409, detail=f"Collection '{target_name}' already exists"
+            )
+
+        cr = await c.put(
+            f"{QDRANT_URL}/collections/{target_name}",
+            json={"vectors": {"size": vec_size, "distance": distance}},
+        )
+        cr.raise_for_status()
+
+        offset = None
+        total = 0
+        while True:
+            scroll_body: dict = {"limit": 100, "with_payload": True, "with_vector": True}
+            if offset is not None:
+                scroll_body["offset"] = offset
+            sr = await c.post(
+                f"{QDRANT_URL}/collections/{archive_name}/points/scroll", json=scroll_body
+            )
+            sr.raise_for_status()
+            result = sr.json().get("result", {})
+            pts = result.get("points", [])
+            if pts:
+                ur = await c.put(
+                    f"{QDRANT_URL}/collections/{target_name}/points",
+                    params={"wait": "true"}, json={"points": pts},
+                )
+                ur.raise_for_status()
+                total += len(pts)
+            offset = result.get("next_page_offset")
+            if offset is None:
+                break
+
+        await c.delete(f"{QDRANT_URL}/collections/{archive_name}")
+
+    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    try:
+        async with driver.session(database=NEO4J_DATABASE) as s:
+            if doc_ids:
+                await s.run(
+                    "UNWIND $ids AS did "
+                    "MATCH (d:Document {document_id: did}) "
+                    "REMOVE d.archived REMOVE d.archived_at REMOVE d.archived_from",
+                    ids=doc_ids,
+                )
+            await s.run(
+                "MATCH (a:ArchivedCollection {qdrant_name: $qname}) DETACH DELETE a",
+                qname=archive_name,
+            )
+    except Exception as exc:
+        logger.warning("Neo4j restore cleanup failed: %s", exc)
+    finally:
+        await driver.close()
+
+    return {"status": "restored", "name": target_name, "points_restored": total}
+
+
 @app.get("/api/search")
 async def api_search(
     collection: str = Query(...),

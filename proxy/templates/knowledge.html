@@ -231,6 +231,63 @@
     }
     .toast.show { transform: translateY(0); opacity: 1; }
 
+    /* ── DELETE / ARCHIVE ── */
+    .btn-del-col {
+      background: none; border: none; color: var(--text-muted); cursor: pointer;
+      padding: 3px 6px; border-radius: 5px; line-height: 1; flex-shrink: 0;
+      transition: color .15s, background .15s;
+    }
+    .btn-del-col:hover { color: #f87171; background: rgba(239,68,68,.1); }
+    .btn-delete {
+      flex: 1; padding: 8px 0; background: transparent; color: var(--text-muted);
+      border: 1px solid var(--card-border); border-radius: 20px; font-size: .8rem;
+      cursor: pointer; transition: all .15s; display: flex; align-items: center;
+      justify-content: center; gap: 5px;
+    }
+    .btn-delete:hover { border-color: #f87171; color: #f87171; background: rgba(239,68,68,.06); }
+    .warning-box {
+      background: rgba(239,68,68,.06); border: 1px solid rgba(239,68,68,.2);
+      border-radius: 8px; padding: 12px 14px; font-size: .82rem; color: #fca5a5;
+      line-height: 1.55; margin-bottom: 16px;
+    }
+    .warning-box strong { color: #f87171; }
+    .btn-danger {
+      width: 100%; padding: 11px; background: #ef4444; color: #fff; border: none;
+      border-radius: 8px; font-size: .9rem; font-weight: 700; cursor: pointer;
+      transition: background .15s; margin-bottom: 8px;
+    }
+    .btn-danger:hover    { background: #dc2626; }
+    .btn-danger:disabled { opacity: .5; cursor: not-allowed; }
+    .btn-cancel {
+      width: 100%; padding: 10px; background: transparent; color: var(--text-dim);
+      border: 1px solid var(--card-border); border-radius: 8px; font-size: .875rem;
+      cursor: pointer; transition: all .15s;
+    }
+    .btn-cancel:hover { border-color: var(--text-dim); color: var(--text); }
+
+    /* ── ARCHIVE ITEMS ── */
+    .archive-item {
+      background: rgba(255,255,255,.025); border: 1px solid var(--card-border);
+      border-radius: 8px; padding: 14px 16px; margin-bottom: 8px;
+    }
+    .archive-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .archive-name { font-size: .9rem; font-weight: 600; color: var(--text); margin-bottom: 3px; }
+    .archive-meta { font-size: .75rem; color: var(--text-muted); }
+    .archive-restore-btn {
+      padding: 7px 16px; background: transparent; color: var(--green);
+      border: 1px solid rgba(74,222,128,.3); border-radius: 20px; font-size: .8rem;
+      cursor: pointer; white-space: nowrap; transition: all .15s; flex-shrink: 0;
+    }
+    .archive-restore-btn:hover { background: var(--green-bg); border-color: var(--green); }
+
+    /* ── EDIT COLLECTION ── */
+    .btn-edit-col {
+      background: none; border: none; color: var(--text-muted); cursor: pointer;
+      padding: 3px 6px; border-radius: 5px; line-height: 1; margin-left: auto; flex-shrink: 0;
+      transition: color .15s, background .15s;
+    }
+    .btn-edit-col:hover { color: var(--cyan); background: var(--cyan-glow); }
+
     /* ── SCROLLBAR ── */
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
@@ -280,6 +337,14 @@
       <button class="tb-btn" onclick="loadCollections()">
         <svg width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
         Refresh
+      </button>
+      <button class="tb-btn" onclick="openArchivesModal()">
+        <svg width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8l1 12a2 2 0 002 2h8a2 2 0 002-2L19 8m-9 4v4m4-4v4"/></svg>
+        Archives
+      </button>
+      <button class="tb-btn" onclick="openNewCollectionModal()">
+        <svg width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4"/></svg>
+        New Collection
       </button>
       <button class="tb-btn primary" onclick="openIngestModal(null)">
         <svg width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"/></svg>
@@ -383,6 +448,128 @@
   </div>
 </div>
 
+<!-- DELETE / ARCHIVE CONFIRMATION MODAL -->
+<div id="delete-modal" class="modal-overlay">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2>
+        <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="display:inline;margin-right:6px;vertical-align:-1px;color:#f87171"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+        Archive Collection<span class="modal-tag" id="delete-col-label"></span>
+      </h2>
+      <button class="btn-close" onclick="closeModal('delete-modal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="warning-box">
+        <strong>This collection will be archived, not permanently deleted.</strong><br>
+        All Qdrant vector embeddings will be preserved in a hidden archive collection.
+        Neo4j Document and Chunk nodes will be marked as archived.
+        You can fully restore everything from the <strong>Archives</strong> panel at any time.
+      </div>
+      <button id="delete-confirm-btn" class="btn-danger" onclick="archiveCollection()">
+        Archive &amp; Delete
+      </button>
+      <button class="btn-cancel" onclick="closeModal('delete-modal')">Cancel</button>
+      <div id="delete-ok"  class="alert alert-ok"  style="margin-top:10px"></div>
+      <div id="delete-err" class="alert alert-err" style="margin-top:10px"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ARCHIVES LIST MODAL -->
+<div id="archives-modal" class="modal-overlay">
+  <div class="modal-box wide">
+    <div class="modal-header">
+      <h2>
+        <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="display:inline;margin-right:6px;vertical-align:-1px"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8l1 12a2 2 0 002 2h8a2 2 0 002-2L19 8m-9 4v4m4-4v4"/></svg>
+        Archives
+      </h2>
+      <button class="btn-close" onclick="closeModal('archives-modal')">✕</button>
+    </div>
+    <div class="modal-body" id="archives-body">
+      <div class="spinner"></div>
+    </div>
+  </div>
+</div>
+
+<!-- RESTORE MODAL -->
+<div id="restore-modal" class="modal-overlay">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2>
+        <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="display:inline;margin-right:6px;vertical-align:-1px"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+        Restore Archive<span class="modal-tag" id="restore-arc-label"></span>
+      </h2>
+      <button class="btn-close" onclick="closeModal('restore-modal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <p style="font-size:.83rem;color:var(--text-muted);margin-bottom:16px;line-height:1.55">
+        All Qdrant vector points will be restored. Neo4j Document nodes will be unmarked.
+        The archive will be removed after a successful restore.
+      </p>
+      <div class="form-group">
+        <label class="form-label">Restore as collection name</label>
+        <input type="text" id="restore-name" class="form-input" placeholder="collection-name"
+               onkeydown="if(event.key==='Enter')restoreArchive()">
+      </div>
+      <button id="restore-submit" class="submit-btn" onclick="restoreArchive()">Restore</button>
+      <div id="restore-ok"  class="alert alert-ok"></div>
+      <div id="restore-err" class="alert alert-err"></div>
+    </div>
+  </div>
+</div>
+
+<!-- NEW COLLECTION MODAL -->
+<div id="new-col-modal" class="modal-overlay">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2>
+        <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="display:inline;margin-right:6px;vertical-align:-1px"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4"/></svg>
+        New Collection
+      </h2>
+      <button class="btn-close" onclick="closeModal('new-col-modal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label class="form-label">Collection Name</label>
+        <input type="text" id="new-col-name" class="form-input" placeholder="my-collection"
+               onkeydown="if(event.key==='Enter')createCollection()">
+        <p style="font-size:.75rem;color:var(--text-muted);margin-top:6px">
+          Used as the Qdrant collection identifier. Letters, numbers, hyphens and underscores.
+        </p>
+      </div>
+      <button id="new-col-submit" class="submit-btn" onclick="createCollection()">Create Collection</button>
+      <div id="new-col-ok"  class="alert alert-ok"></div>
+      <div id="new-col-err" class="alert alert-err"></div>
+    </div>
+  </div>
+</div>
+
+<!-- RENAME COLLECTION MODAL -->
+<div id="rename-modal" class="modal-overlay">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2>
+        <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="display:inline;margin-right:6px;vertical-align:-1px"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+        Rename Collection<span class="modal-tag" id="rename-col-label"></span>
+      </h2>
+      <button class="btn-close" onclick="closeModal('rename-modal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label class="form-label">New Name</label>
+        <input type="text" id="rename-col-name" class="form-input" placeholder="new-name"
+               onkeydown="if(event.key==='Enter')renameCollection()">
+        <p style="font-size:.75rem;color:var(--text-muted);margin-top:6px">
+          All vector points will be copied to the new collection. The old collection will be deleted.
+        </p>
+      </div>
+      <button id="rename-submit" class="submit-btn" onclick="renameCollection()">Rename</button>
+      <div id="rename-ok"  class="alert alert-ok"></div>
+      <div id="rename-err" class="alert alert-err"></div>
+    </div>
+  </div>
+</div>
+
 <div id="toast" class="toast"></div>
 
 <script>
@@ -435,6 +622,12 @@
       <div class="card-title-row">
         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
         <span class="card-title">${esc(col.name)}</span>
+        <button class="btn-edit-col" onclick="openRenameModal('${esc(col.name)}')" title="Rename collection">
+          <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+        </button>
+        <button class="btn-del-col" onclick="openDeleteModal('${esc(col.name)}')" title="Archive &amp; delete collection">
+          <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+        </button>
       </div>
       <div class="card-badges">
         <span class="badge-healthy">HEALTHY</span>
@@ -459,6 +652,10 @@
         <button class="btn-ingest" onclick="openIngestModal('${esc(col.name)}')">
           <svg width="11" height="11" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
           Ingest
+        </button>
+        <button class="btn-delete" onclick="openDeleteModal('${esc(col.name)}')">
+          <svg width="11" height="11" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+          Delete
         </button>
       </div>
     </div>`;
@@ -561,6 +758,186 @@
     const f = e.dataTransfer.files[0];
     if (f) { const dt = new DataTransfer(); dt.items.add(f); document.getElementById('file-input').files = dt.files; onFileSelected(document.getElementById('file-input')); }
   });
+
+  // ── Delete / Archive modal ─────────────────────────────────────────────────
+  let _deleteCol = null;
+
+  function openDeleteModal(name) {
+    _deleteCol = name;
+    document.getElementById('delete-col-label').textContent = ' — ' + name;
+    document.getElementById('delete-ok').style.display  = 'none';
+    document.getElementById('delete-err').style.display = 'none';
+    document.getElementById('delete-modal').classList.add('open');
+  }
+
+  async function archiveCollection() {
+    const ok  = document.getElementById('delete-ok');
+    const err = document.getElementById('delete-err');
+    const btn = document.getElementById('delete-confirm-btn');
+    ok.style.display = err.style.display = 'none';
+    btn.disabled = true; btn.textContent = 'Archiving…';
+    try {
+      const r = await fetch(`/api/collections/${enc(_deleteCol)}`, { method: 'DELETE' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+      ok.innerHTML = `✓ Archived — ${d.documents} docs · ${d.points} vectors preserved`;
+      ok.style.display = 'block';
+      showToast(`✓ "${_deleteCol}" archived (${d.points} vectors preserved)`);
+      setTimeout(() => { closeModal('delete-modal'); loadCollections(); }, 2200);
+    } catch (e) { err.textContent = e.message; err.style.display = 'block'; }
+    finally { btn.disabled = false; btn.textContent = 'Archive & Delete'; }
+  }
+
+  // ── Archives list modal ────────────────────────────────────────────────────
+  async function openArchivesModal() {
+    document.getElementById('archives-modal').classList.add('open');
+    const body = document.getElementById('archives-body');
+    body.innerHTML = '<div class="spinner"></div>';
+    try {
+      const r = await fetch('/api/archives');
+      const d = await r.json();
+      if (!d.archives.length) {
+        body.innerHTML = `<div class="empty" style="padding:40px 0">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8l1 12a2 2 0 002 2h8a2 2 0 002-2L19 8"/></svg>
+          <p>No archives yet.<br>Delete a collection to archive it.</p>
+        </div>`;
+        return;
+      }
+      body.innerHTML = d.archives.map(a => `
+        <div class="archive-item">
+          <div class="archive-row">
+            <div style="min-width:0">
+              <div class="archive-name">${esc(a.original_name)}</div>
+              <div class="archive-meta">
+                ${a.doc_count} doc${a.doc_count !== 1 ? 's' : ''} &nbsp;·&nbsp;
+                ${a.points_count} vector${a.points_count !== 1 ? 's' : ''} &nbsp;·&nbsp;
+                archived ${fmtDate(a.archived_at)}
+              </div>
+              ${!a.qdrant_exists ? '<span style="color:#f87171;font-size:.72rem;margin-top:3px;display:block">⚠ Qdrant archive collection missing</span>' : ''}
+            </div>
+            ${a.qdrant_exists
+              ? `<button class="archive-restore-btn" onclick="openRestoreModal('${esc(a.qdrant_name)}','${esc(a.original_name)}')">Restore</button>`
+              : ''}
+          </div>
+        </div>`).join('');
+    } catch (e) {
+      body.innerHTML = `<p style="color:#f87171;font-size:.85rem">${e.message}</p>`;
+    }
+  }
+
+  // ── Restore modal ──────────────────────────────────────────────────────────
+  let _restoreArchiveName = null;
+
+  function openRestoreModal(archiveName, originalName) {
+    _restoreArchiveName = archiveName;
+    document.getElementById('restore-arc-label').textContent = ' — ' + originalName;
+    document.getElementById('restore-name').value = originalName;
+    document.getElementById('restore-ok').style.display  = 'none';
+    document.getElementById('restore-err').style.display = 'none';
+    document.getElementById('restore-modal').classList.add('open');
+    setTimeout(() => {
+      const el = document.getElementById('restore-name');
+      el.focus(); el.select();
+    }, 120);
+  }
+
+  async function restoreArchive() {
+    const name = document.getElementById('restore-name').value.trim();
+    const ok   = document.getElementById('restore-ok');
+    const err  = document.getElementById('restore-err');
+    const btn  = document.getElementById('restore-submit');
+    ok.style.display = err.style.display = 'none';
+    if (!name) { err.textContent = 'Please enter a collection name.'; err.style.display = 'block'; return; }
+    btn.disabled = true; btn.textContent = 'Restoring…';
+    try {
+      const r = await fetch(`/api/archives/${enc(_restoreArchiveName)}/restore`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ name }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+      ok.innerHTML = `✓ Restored as <strong>${esc(d.name)}</strong> — ${d.points_restored} vectors`;
+      ok.style.display = 'block';
+      showToast(`✓ Restored "${d.name}" (${d.points_restored} vectors)`);
+      setTimeout(() => {
+        closeModal('restore-modal');
+        closeModal('archives-modal');
+        loadCollections();
+      }, 2000);
+    } catch (e) { err.textContent = e.message; err.style.display = 'block'; }
+    finally { btn.disabled = false; btn.textContent = 'Restore'; }
+  }
+
+  // ── New Collection modal ───────────────────────────────────────────────────
+  function openNewCollectionModal() {
+    document.getElementById('new-col-name').value = '';
+    document.getElementById('new-col-ok').style.display  = 'none';
+    document.getElementById('new-col-err').style.display = 'none';
+    document.getElementById('new-col-modal').classList.add('open');
+    setTimeout(() => document.getElementById('new-col-name').focus(), 120);
+  }
+
+  async function createCollection() {
+    const name = document.getElementById('new-col-name').value.trim();
+    const ok   = document.getElementById('new-col-ok');
+    const err  = document.getElementById('new-col-err');
+    const btn  = document.getElementById('new-col-submit');
+    ok.style.display = err.style.display = 'none';
+    if (!name) { err.textContent = 'Please enter a collection name.'; err.style.display = 'block'; return; }
+    btn.disabled = true; btn.textContent = 'Creating…';
+    try {
+      const r = await fetch('/api/collections', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ name }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+      ok.innerHTML = `✓ Collection <strong>${esc(d.name)}</strong> created`;
+      ok.style.display = 'block';
+      showToast(`✓ Collection "${d.name}" created`);
+      setTimeout(() => { closeModal('new-col-modal'); loadCollections(); }, 1500);
+    } catch (e) { err.textContent = e.message; err.style.display = 'block'; }
+    finally { btn.disabled = false; btn.textContent = 'Create Collection'; }
+  }
+
+  // ── Rename modal ───────────────────────────────────────────────────────────
+  let _renameCol = null;
+
+  function openRenameModal(name) {
+    _renameCol = name;
+    document.getElementById('rename-col-label').textContent = ' — ' + name;
+    document.getElementById('rename-col-name').value = name;
+    document.getElementById('rename-ok').style.display  = 'none';
+    document.getElementById('rename-err').style.display = 'none';
+    document.getElementById('rename-modal').classList.add('open');
+    setTimeout(() => {
+      const el = document.getElementById('rename-col-name');
+      el.focus(); el.select();
+    }, 120);
+  }
+
+  async function renameCollection() {
+    const newName = document.getElementById('rename-col-name').value.trim();
+    const ok  = document.getElementById('rename-ok');
+    const err = document.getElementById('rename-err');
+    const btn = document.getElementById('rename-submit');
+    ok.style.display = err.style.display = 'none';
+    if (!newName) { err.textContent = 'Please enter a new name.'; err.style.display = 'block'; return; }
+    btn.disabled = true; btn.textContent = 'Renaming…';
+    try {
+      const r = await fetch(`/api/collections/${enc(_renameCol)}`, {
+        method: 'PATCH', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ name: newName }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+      ok.innerHTML = `✓ Renamed to <strong>${esc(d.name)}</strong> — ${d.points_copied ?? 0} points copied`;
+      ok.style.display = 'block';
+      showToast(`✓ Renamed to "${d.name}"`);
+      setTimeout(() => { closeModal('rename-modal'); loadCollections(); }, 1800);
+    } catch (e) { err.textContent = e.message; err.style.display = 'block'; }
+    finally { btn.disabled = false; btn.textContent = 'Rename'; }
+  }
 
   // ── Helpers ────────────────────────────────────────────────────────────────
   function closeModal(id) { document.getElementById(id).classList.remove('open'); }
