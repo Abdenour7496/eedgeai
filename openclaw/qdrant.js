@@ -22,7 +22,7 @@
 const { QdrantClient } = require('@qdrant/js-client-rest');
 const https = require('https');
 
-const QDRANT_URL      = process.env.QDRANT_URL      || 'http://quarant:6333';
+const QDRANT_URL      = process.env.QDRANT_URL      || 'http://qdrant:6333';
 const OPENAI_API_KEY  = process.env.OPENAI_API_KEY  || '';
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'text-embedding-3-small';
 const MAX_RETRY       = parseInt(process.env.QDRANT_MAX_RETRIES || '3', 10);

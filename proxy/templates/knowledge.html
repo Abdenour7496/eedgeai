@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>EedgeAI — Knowledge</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:           #080d18;
+      --sidebar-bg:   #0a1020;
+      --topbar-bg:    #0a1020;
+      --card-bg:      #0d1526;
+      --card-border:  #1a2b44;
+      --card-hover:   #253d5e;
+      --text:         #e2e8f0;
+      --text-dim:     #94a3b8;
+      --text-muted:   #4a5568;
+      --cyan:         #22d3ee;
+      --cyan-glow:    rgba(34,211,238,.12);
+      --green:        #4ade80;
+      --green-bg:     rgba(74,222,128,.1);
+      --purple:       #a78bfa;
+      --input-bg:     #060c18;
+    }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+           background: var(--bg); color: var(--text); min-height: 100vh; display: flex; }
+
+    /* ── SIDEBAR ── */
+    .sidebar {
+      width: 210px; min-height: 100vh; background: var(--sidebar-bg);
+      border-right: 1px solid var(--card-border);
+      display: flex; flex-direction: column; flex-shrink: 0;
+      position: sticky; top: 0; height: 100vh; overflow: hidden;
+    }
+    .sidebar-brand {
+      padding: 22px 20px 18px; border-bottom: 1px solid var(--card-border);
+    }
+    .brand-name { font-size: 1.05rem; font-weight: 700; color: var(--cyan); letter-spacing: -.3px; }
+    .brand-sub  { font-size: .7rem; color: var(--text-muted); margin-top: 3px; }
+    .sidebar-nav { padding: 10px 0; flex: 1; }
+    .nav-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 9px 20px; color: var(--text-dim); text-decoration: none;
+      font-size: .84rem; transition: all .15s; border-right: 2px solid transparent;
+    }
+    .nav-item:hover  { background: rgba(255,255,255,.04); color: var(--text); }
+    .nav-item.active { background: var(--cyan-glow); color: var(--cyan); border-right-color: var(--cyan); }
+    .nav-item svg    { width: 15px; height: 15px; flex-shrink: 0; }
+    .nav-sep { height: 1px; background: var(--card-border); margin: 8px 20px; }
+
+    /* ── MAIN WRAPPER ── */
+    .main-wrapper { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-height: 100vh; }
+
+    /* ── TOP BAR ── */
+    .topbar {
+      height: 54px; background: var(--topbar-bg); border-bottom: 1px solid var(--card-border);
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 28px; position: sticky; top: 0; z-index: 20; flex-shrink: 0;
+    }
+    .topbar-left  { display: flex; align-items: center; gap: 20px; }
+    .topbar-right { display: flex; align-items: center; gap: 10px; }
+    .topbar-title { font-size: .82rem; color: var(--text-muted); }
+    .tb-btn {
+      padding: 6px 14px; border: 1px solid var(--card-border); background: transparent;
+      color: var(--text-dim); border-radius: 20px; font-size: .78rem;
+      cursor: pointer; transition: all .15s; display: flex; align-items: center; gap: 5px;
+    }
+    .tb-btn:hover       { border-color: var(--cyan); color: var(--cyan); }
+    .tb-btn.primary     { background: var(--cyan); color: #000; border-color: var(--cyan); font-weight: 600; }
+    .tb-btn.primary:hover { background: #67e8f9; }
+
+    /* ── CONTENT ── */
+    .content { padding: 36px 32px; flex: 1; overflow-y: auto; }
+    .page-header { margin-bottom: 28px; }
+    .page-header h1 { font-size: 1.9rem; font-weight: 700; margin-bottom: 5px; }
+    .page-header p  { color: var(--text-muted); font-size: .875rem; }
+
+    /* ── STATS BAR ── */
+    .stats-bar {
+      display: flex; gap: 16px; margin-bottom: 28px; flex-wrap: wrap;
+    }
+    .stat-pill {
+      background: var(--card-bg); border: 1px solid var(--card-border);
+      border-radius: 8px; padding: 10px 18px; font-size: .8rem;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .stat-pill .val { font-size: 1.1rem; font-weight: 700; color: var(--cyan); }
+
+    /* ── CARDS GRID ── */
+    .cards-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 18px; }
+    .card {
+      background: var(--card-bg); border: 1px solid var(--card-border);
+      border-radius: 14px; padding: 22px; display: flex; flex-direction: column;
+      gap: 12px; transition: border-color .2s, box-shadow .2s;
+    }
+    .card:hover { border-color: var(--card-hover); box-shadow: 0 4px 24px rgba(0,0,0,.3); }
+    .card-title-row { display: flex; align-items: center; gap: 8px; }
+    .card-title-row svg { color: var(--cyan); width: 17px; height: 17px; flex-shrink: 0; }
+    .card-title { font-size: 1.05rem; font-weight: 700; }
+    .card-badges { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+    .badge-healthy {
+      font-size: .68rem; font-weight: 700; letter-spacing: .06em;
+      padding: 2px 8px; border-radius: 20px;
+      background: var(--green-bg); color: var(--green);
+      border: 1px solid rgba(74,222,128,.25);
+    }
+    .badge-model {
+      font-size: .72rem; color: var(--text-dim); padding: 2px 8px;
+      background: rgba(255,255,255,.04); border: 1px solid var(--card-border); border-radius: 20px;
+    }
+    .card-desc { font-size: .82rem; color: var(--text-muted); line-height: 1.5; }
+    .sources-label { display: flex; align-items: center; gap: 6px; font-size: .78rem; color: var(--text-dim); }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--cyan); flex-shrink: 0; }
+    .source-list { display: flex; flex-direction: column; gap: 5px; }
+    .source-item {
+      display: flex; align-items: center; gap: 8px;
+      background: rgba(255,255,255,.025); border: 1px solid var(--card-border);
+      border-radius: 6px; padding: 5px 9px; font-size: .76rem;
+    }
+    .src-icon {
+      width: 17px; height: 17px; border-radius: 3px; flex-shrink: 0;
+      background: rgba(34,211,238,.15); display: flex; align-items: center;
+      justify-content: center; color: var(--cyan); font-size: .6rem;
+    }
+    .src-name { flex: 1; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .src-date { color: var(--text-muted); flex-shrink: 0; }
+
+    /* ── CARD ACTIONS ── */
+    .card-actions { display: flex; gap: 7px; padding-top: 2px; }
+    .btn-test {
+      flex: 1.3; padding: 8px 0; background: var(--cyan); color: #000;
+      border: none; border-radius: 20px; font-size: .8rem; font-weight: 700;
+      cursor: pointer; transition: all .15s; display: flex; align-items: center;
+      justify-content: center; gap: 5px;
+    }
+    .btn-test:hover { background: #67e8f9; transform: translateY(-1px); }
+    .btn-view, .btn-ingest {
+      flex: 1; padding: 8px 0; background: transparent; color: var(--text-dim);
+      border: 1px solid var(--card-border); border-radius: 20px; font-size: .8rem;
+      cursor: pointer; transition: all .15s; display: flex; align-items: center;
+      justify-content: center; gap: 5px;
+    }
+    .btn-view:hover   { border-color: var(--cyan);   color: var(--cyan); }
+    .btn-ingest:hover { border-color: var(--purple); color: var(--purple); }
+
+    /* ── SKELETON ── */
+    .skeleton { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 14px; height: 300px; animation: pulse 1.6s ease-in-out infinite; }
+    @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.4 } }
+
+    /* ── MODAL ── */
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,.75); backdrop-filter: blur(5px);
+      z-index: 100; display: none; align-items: center; justify-content: center; padding: 20px;
+    }
+    .modal-overlay.open { display: flex; }
+    .modal-box {
+      background: #0d1526; border: 1px solid var(--card-border); border-radius: 16px;
+      width: 100%; max-width: 620px; max-height: 82vh; display: flex; flex-direction: column; overflow: hidden;
+    }
+    .modal-box.wide { max-width: 780px; }
+    .modal-header {
+      padding: 18px 22px 14px; border-bottom: 1px solid var(--card-border);
+      display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+    }
+    .modal-header h2 { font-size: 1rem; font-weight: 600; color: var(--text); }
+    .modal-tag { font-size: .75rem; color: var(--text-muted); font-weight: 400; margin-left: 8px; }
+    .btn-close { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 1.1rem; padding: 4px 8px; border-radius: 6px; line-height: 1; }
+    .btn-close:hover { background: rgba(255,255,255,.08); color: var(--text); }
+    .modal-body { padding: 20px 22px; flex: 1; overflow-y: auto; }
+
+    /* ── SEARCH ── */
+    .search-row { display: flex; gap: 8px; margin-bottom: 16px; }
+    .search-input {
+      flex: 1; padding: 10px 14px; background: var(--input-bg);
+      border: 1px solid var(--card-border); border-radius: 8px;
+      color: var(--text); font-size: .875rem; outline: none;
+    }
+    .search-input:focus { border-color: var(--cyan); }
+    .search-btn { padding: 10px 20px; background: var(--cyan); color: #000; border: none; border-radius: 8px; font-weight: 700; cursor: pointer; font-size: .875rem; transition: background .15s; }
+    .search-btn:hover { background: #67e8f9; }
+    .result-item { background: rgba(255,255,255,.03); border: 1px solid var(--card-border); border-radius: 8px; padding: 14px; margin-bottom: 8px; }
+    .result-score { font-size: .72rem; color: var(--cyan); font-weight: 600; margin-bottom: 5px; }
+    .result-text  { font-size: .82rem; color: var(--text-dim); line-height: 1.55; }
+    .result-meta  { font-size: .72rem; color: var(--text-muted); margin-top: 5px; }
+
+    /* ── INGEST FORM ── */
+    .form-group { margin-bottom: 14px; }
+    .form-label { display: block; font-size: .8rem; color: var(--text-dim); margin-bottom: 5px; }
+    .form-input, .form-select {
+      width: 100%; padding: 9px 12px; background: var(--input-bg);
+      border: 1px solid var(--card-border); border-radius: 8px;
+      color: var(--text); font-size: .875rem; transition: border-color .15s;
+    }
+    .form-input:focus, .form-select:focus { outline: none; border-color: var(--cyan); }
+    .drop-zone {
+      border: 2px dashed var(--card-border); border-radius: 10px; padding: 28px 20px;
+      text-align: center; cursor: pointer; transition: all .2s; position: relative;
+      background: rgba(255,255,255,.01);
+    }
+    .drop-zone:hover, .drop-zone.over { border-color: var(--cyan); background: var(--cyan-glow); }
+    .drop-zone svg { width: 30px; height: 30px; color: var(--text-muted); margin-bottom: 8px; }
+    .drop-zone p   { font-size: .82rem; color: var(--text-muted); }
+    .drop-zone strong { color: var(--cyan); }
+    .drop-zone input[type=file] { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+    .submit-btn {
+      width: 100%; padding: 11px; background: var(--cyan); color: #000; border: none;
+      border-radius: 8px; font-size: .9rem; font-weight: 700; cursor: pointer; transition: all .15s; margin-top: 4px;
+    }
+    .submit-btn:hover    { background: #67e8f9; }
+    .submit-btn:disabled { opacity: .5; cursor: not-allowed; }
+    .alert { border-radius: 8px; padding: 12px 14px; font-size: .82rem; margin-top: 10px; display: none; }
+    .alert-ok  { background: rgba(74,222,128,.08); border: 1px solid rgba(74,222,128,.25); color: var(--green); }
+    .alert-err { background: rgba(239,68,68,.08);  border: 1px solid rgba(239,68,68,.25);  color: #f87171; }
+
+    /* ── SPINNER ── */
+    .spinner { border: 2px solid var(--card-border); border-top-color: var(--cyan); border-radius: 50%; width: 24px; height: 24px; animation: spin .6s linear infinite; margin: 20px auto; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── EMPTY ── */
+    .empty { text-align: center; padding: 48px 20px; color: var(--text-muted); }
+    .empty svg { width: 44px; height: 44px; margin-bottom: 14px; opacity: .25; }
+    .empty p { font-size: .875rem; }
+
+    /* ── TOAST ── */
+    .toast {
+      position: fixed; bottom: 24px; right: 24px; background: #1a2535;
+      border: 1px solid var(--card-border); border-radius: 10px; padding: 12px 18px;
+      font-size: .84rem; z-index: 300; max-width: 360px;
+      transform: translateY(70px); opacity: 0; transition: all .3s;
+    }
+    .toast.show { transform: translateY(0); opacity: 1; }
+
+    /* ── SCROLLBAR ── */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--card-border); border-radius: 3px; }
+  </style>
+</head>
+<body>
+
+<!-- SIDEBAR -->
+<aside class="sidebar">
+  <div class="sidebar-brand">
+    <div class="brand-name">⚡ EedgeAI</div>
+    <div class="brand-sub">Cognitive Infrastructure</div>
+  </div>
+  <nav class="sidebar-nav">
+    <a class="nav-item active" href="/knowledge">
+      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4"/></svg>
+      Knowledge
+    </a>
+    <div class="nav-sep"></div>
+    <a class="nav-item" href="http://localhost:8080" target="_blank">
+      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/></svg>
+      OpenWebUI
+    </a>
+    <a class="nav-item" href="http://localhost:18799" target="_blank">
+      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+      OpenClaw
+    </a>
+    <a class="nav-item" href="http://localhost:7474" target="_blank">
+      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M19.07 4.93a10 10 0 010 14.14M4.93 4.93a10 10 0 000 14.14"/></svg>
+      Neo4j Browser
+    </a>
+    <a class="nav-item" href="http://localhost:3000" target="_blank">
+      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+      Grafana
+    </a>
+  </nav>
+</aside>
+
+<!-- MAIN -->
+<div class="main-wrapper">
+  <div class="topbar">
+    <div class="topbar-left">
+      <span class="topbar-title">GCOR Knowledge Base</span>
+    </div>
+    <div class="topbar-right">
+      <button class="tb-btn" onclick="loadCollections()">
+        <svg width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+        Refresh
+      </button>
+      <button class="tb-btn primary" onclick="openIngestModal(null)">
+        <svg width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"/></svg>
+        Ingest Document
+      </button>
+    </div>
+  </div>
+
+  <div class="content">
+    <div class="page-header">
+      <h1>Knowledge</h1>
+      <p>All GCOR collections with their documents, embedding models and sources</p>
+    </div>
+
+    <div id="stats-bar" class="stats-bar"></div>
+    <div id="cards-grid" class="cards-grid">
+      <div class="skeleton"></div>
+      <div class="skeleton"></div>
+      <div class="skeleton"></div>
+    </div>
+  </div>
+</div>
+
+<!-- TEST MODAL -->
+<div id="test-modal" class="modal-overlay">
+  <div class="modal-box wide">
+    <div class="modal-header">
+      <h2>
+        <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="display:inline;margin-right:6px;vertical-align:-1px"><polygon points="5,3 19,12 5,21" stroke-width="2" stroke-linejoin="round" fill="currentColor"/></svg>
+        Test<span class="modal-tag" id="test-col-label"></span>
+      </h2>
+      <button class="btn-close" onclick="closeModal('test-modal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="search-row">
+        <input id="test-query" class="search-input" placeholder="Enter a semantic search query…"
+               onkeydown="if(event.key==='Enter')runSearch()">
+        <button class="search-btn" onclick="runSearch()">Search</button>
+      </div>
+      <div id="test-results"></div>
+    </div>
+  </div>
+</div>
+
+<!-- VIEW MODAL -->
+<div id="view-modal" class="modal-overlay">
+  <div class="modal-box wide">
+    <div class="modal-header">
+      <h2>
+        <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="display:inline;margin-right:6px;vertical-align:-1px"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+        Documents<span class="modal-tag" id="view-col-label"></span>
+      </h2>
+      <button class="btn-close" onclick="closeModal('view-modal')">✕</button>
+    </div>
+    <div class="modal-body" id="view-body"></div>
+  </div>
+</div>
+
+<!-- INGEST MODAL -->
+<div id="ingest-modal" class="modal-overlay">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h2>
+        <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="display:inline;margin-right:6px;vertical-align:-1px"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+        Ingest Document<span class="modal-tag" id="ingest-col-label"></span>
+      </h2>
+      <button class="btn-close" onclick="closeModal('ingest-modal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <div class="drop-zone" id="drop-zone">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>
+          <p id="drop-label"><strong>Click to upload</strong> or drag &amp; drop</p>
+          <p style="font-size:.72rem;margin-top:4px;color:var(--text-muted)">.txt .md .pdf .docx .json .csv</p>
+          <input type="file" id="file-input" accept=".txt,.md,.pdf,.docx,.json,.csv" onchange="onFileSelected(this)">
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Title <span style="color:var(--text-muted)">(optional — defaults to filename)</span></label>
+        <input type="text" id="ingest-title" class="form-input" placeholder="My Document">
+      </div>
+      <div style="display:flex;gap:10px">
+        <div class="form-group" style="flex:1">
+          <label class="form-label">Agent ID <span style="color:var(--text-muted)">(optional)</span></label>
+          <input type="text" id="ingest-agent" class="form-input" placeholder="shared">
+        </div>
+        <div class="form-group" style="flex:1">
+          <label class="form-label">Access level</label>
+          <select id="ingest-access" class="form-select">
+            <option value="public">public</option>
+            <option value="restricted">restricted</option>
+          </select>
+        </div>
+      </div>
+      <button id="ingest-submit" class="submit-btn" onclick="submitIngest()">
+        ↑ &nbsp;Ingest Document
+      </button>
+      <div id="ingest-ok"  class="alert alert-ok"></div>
+      <div id="ingest-err" class="alert alert-err"></div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+  let _testCol = null;
+
+  // ── Load collections ───────────────────────────────────────────────────────
+  async function loadCollections() {
+    const grid  = document.getElementById('cards-grid');
+    const stats = document.getElementById('stats-bar');
+    grid.innerHTML  = '<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>';
+    stats.innerHTML = '';
+    try {
+      const r = await fetch('/api/collections');
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+
+      // Stats bar
+      const totalDocs   = d.collections.reduce((a, c) => a + (c.doc_count   || 0), 0);
+      const totalChunks = d.collections.reduce((a, c) => a + (c.points_count || 0), 0);
+      stats.innerHTML = `
+        <div class="stat-pill"><span class="val">${d.collections.length}</span> Collection${d.collections.length !== 1 ? 's' : ''}</div>
+        <div class="stat-pill"><span class="val">${totalDocs}</span> Documents</div>
+        <div class="stat-pill"><span class="val">${totalChunks}</span> Vector Chunks</div>
+        <div class="stat-pill"><span class="val">${esc(d.embedding_model || 'text-embedding-3-small')}</span></div>
+      `;
+
+      if (!d.collections.length) {
+        grid.innerHTML = `<div class="empty" style="grid-column:1/-1">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10"/></svg>
+          <p>No collections found.<br>Ingest a document to get started.</p>
+        </div>`;
+        return;
+      }
+      grid.innerHTML = d.collections.map(renderCard).join('');
+    } catch (e) {
+      grid.innerHTML = `<div class="empty" style="grid-column:1/-1;color:#f87171"><p>Failed to load: ${e.message}</p></div>`;
+    }
+  }
+
+  function renderCard(col) {
+    const docs = (col.recent_docs || []).slice(0, 3);
+    const docItems = docs.map(d => `
+      <div class="source-item">
+        <div class="src-icon">▤</div>
+        <span class="src-name" title="${esc(d.title)}">${esc(d.title)}</span>
+        <span class="src-date">${fmtDate(d.created_at)}</span>
+      </div>`).join('');
+    return `
+    <div class="card">
+      <div class="card-title-row">
+        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
+        <span class="card-title">${esc(col.name)}</span>
+      </div>
+      <div class="card-badges">
+        <span class="badge-healthy">HEALTHY</span>
+        <span class="badge-model">${esc(col.embedding_model || 'text-embedding-3-small')}</span>
+      </div>
+      <p class="card-desc">GCOR knowledge collection — Neo4j graph backbone + Qdrant vector index</p>
+      <div class="sources-label">
+        <div class="dot"></div>
+        ${col.doc_count} Document${col.doc_count !== 1 ? 's' : ''}
+        &nbsp;·&nbsp; ${col.points_count} Chunk${col.points_count !== 1 ? 's' : ''}
+      </div>
+      ${docItems ? `<div class="source-list">${docItems}</div>` : ''}
+      <div class="card-actions">
+        <button class="btn-test" onclick="openTestModal('${esc(col.name)}')">
+          <svg width="11" height="11" fill="currentColor" viewBox="0 0 24 24"><polygon points="5,3 19,12 5,21"/></svg>
+          Test
+        </button>
+        <button class="btn-view" onclick="openViewModal('${esc(col.name)}')">
+          <svg width="11" height="11" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+          View
+        </button>
+        <button class="btn-ingest" onclick="openIngestModal('${esc(col.name)}')">
+          <svg width="11" height="11" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+          Ingest
+        </button>
+      </div>
+    </div>`;
+  }
+
+  // ── Test modal ─────────────────────────────────────────────────────────────
+  function openTestModal(name) {
+    _testCol = name;
+    document.getElementById('test-col-label').textContent = ' — ' + name;
+    document.getElementById('test-query').value = '';
+    document.getElementById('test-results').innerHTML = '';
+    document.getElementById('test-modal').classList.add('open');
+    setTimeout(() => document.getElementById('test-query').focus(), 120);
+  }
+
+  async function runSearch() {
+    const q = document.getElementById('test-query').value.trim();
+    if (!q) return;
+    const el = document.getElementById('test-results');
+    el.innerHTML = '<div class="spinner"></div>';
+    try {
+      const r = await fetch(`/api/search?collection=${enc(_testCol)}&q=${enc(q)}`);
+      const d = await r.json();
+      if (!d.results?.length) { el.innerHTML = '<p style="color:var(--text-muted);text-align:center;padding:20px;font-size:.85rem">No results found.</p>'; return; }
+      el.innerHTML = d.results.map(r => `
+        <div class="result-item">
+          <div class="result-score">Score: ${(r.score * 100).toFixed(1)}%&emsp;${esc(r.doc_title || '')}</div>
+          <div class="result-text">${esc(r.text)}</div>
+          <div class="result-meta">Neo4j: ${esc(r.neo4j_element_id || '')} &nbsp;·&nbsp; pos ${r.position ?? '–'}</div>
+        </div>`).join('');
+    } catch (e) { el.innerHTML = `<p style="color:#f87171;font-size:.85rem">${e.message}</p>`; }
+  }
+
+  // ── View modal ─────────────────────────────────────────────────────────────
+  async function openViewModal(name) {
+    document.getElementById('view-col-label').textContent = ' — ' + name;
+    const body = document.getElementById('view-body');
+    body.innerHTML = '<div class="spinner"></div>';
+    document.getElementById('view-modal').classList.add('open');
+    try {
+      const r = await fetch(`/api/collections/${enc(name)}/docs`);
+      const d = await r.json();
+      if (!d.docs?.length) { body.innerHTML = '<p style="color:var(--text-muted);text-align:center;padding:20px;font-size:.85rem">No documents yet.</p>'; return; }
+      body.innerHTML = d.docs.map(doc => `
+        <div class="result-item">
+          <div class="result-score">${esc(doc.title)}</div>
+          <div class="result-text" style="color:var(--text-muted)">${doc.chunk_count} chunk${doc.chunk_count !== 1 ? 's' : ''} &nbsp;·&nbsp; ${fmtDate(doc.created_at)}</div>
+          <div class="result-meta">ID: ${esc(doc.doc_id)} &nbsp;·&nbsp; access: ${esc(doc.access_level || 'public')}</div>
+        </div>`).join('');
+    } catch (e) { body.innerHTML = `<p style="color:#f87171;font-size:.85rem">${e.message}</p>`; }
+  }
+
+  // ── Ingest modal ───────────────────────────────────────────────────────────
+  function openIngestModal(col) {
+    document.getElementById('ingest-col-label').textContent = col ? ' — ' + col : '';
+    document.getElementById('ingest-ok').style.display  = 'none';
+    document.getElementById('ingest-err').style.display = 'none';
+    document.getElementById('drop-label').innerHTML = '<strong>Click to upload</strong> or drag &amp; drop';
+    document.getElementById('file-input').value = '';
+    document.getElementById('ingest-title').value = '';
+    document.getElementById('ingest-modal').classList.add('open');
+  }
+
+  function onFileSelected(inp) {
+    const f = inp.files[0];
+    if (f) document.getElementById('drop-label').innerHTML = `<strong>${esc(f.name)}</strong> &nbsp;(${(f.size/1024).toFixed(1)} KB)`;
+  }
+
+  async function submitIngest() {
+    const fi  = document.getElementById('file-input');
+    const ok  = document.getElementById('ingest-ok');
+    const err = document.getElementById('ingest-err');
+    const btn = document.getElementById('ingest-submit');
+    ok.style.display = err.style.display = 'none';
+    if (!fi.files[0]) { err.textContent = 'Please select a file.'; err.style.display = 'block'; return; }
+    btn.disabled = true; btn.textContent = 'Ingesting…';
+    const fd = new FormData();
+    fd.append('file',         fi.files[0]);
+    fd.append('title',        document.getElementById('ingest-title').value);
+    fd.append('agent_id',     document.getElementById('ingest-agent').value);
+    fd.append('access_level', document.getElementById('ingest-access').value);
+    try {
+      const r = await fetch('/api/ingest', { method: 'POST', body: fd });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+      ok.innerHTML = `✓ <strong>${esc(d.title)}</strong> ingested — ${d.chunks} chunks · ${d.qdrant_points} vectors`;
+      ok.style.display = 'block';
+      showToast(`✓ Ingested "${d.title}" (${d.chunks} chunks)`);
+      setTimeout(() => { closeModal('ingest-modal'); loadCollections(); }, 2200);
+    } catch (e) { err.textContent = e.message; err.style.display = 'block'; }
+    finally { btn.disabled = false; btn.textContent = '↑  Ingest Document'; }
+  }
+
+  // ── Drag & drop ────────────────────────────────────────────────────────────
+  const dz = document.getElementById('drop-zone');
+  dz.addEventListener('dragover',  e => { e.preventDefault(); dz.classList.add('over'); });
+  dz.addEventListener('dragleave', ()  => dz.classList.remove('over'));
+  dz.addEventListener('drop', e => {
+    e.preventDefault(); dz.classList.remove('over');
+    const f = e.dataTransfer.files[0];
+    if (f) { const dt = new DataTransfer(); dt.items.add(f); document.getElementById('file-input').files = dt.files; onFileSelected(document.getElementById('file-input')); }
+  });
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+  function closeModal(id) { document.getElementById(id).classList.remove('open'); }
+  document.querySelectorAll('.modal-overlay').forEach(el => el.addEventListener('click', e => { if (e.target === el) el.classList.remove('open'); }));
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') document.querySelectorAll('.modal-overlay.open').forEach(el => el.classList.remove('open')); });
+  function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+  function enc(s) { return encodeURIComponent(s||''); }
+  function fmtDate(iso) { if (!iso) return ''; try { return new Date(iso).toLocaleDateString('en-US',{month:'numeric',day:'numeric',year:'numeric'}); } catch { return iso; } }
+  function showToast(msg) { const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),3000); }
+
+  loadCollections();
+</script>
+</body>
+</html>

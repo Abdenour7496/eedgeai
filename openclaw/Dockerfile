@@ -8,12 +8,13 @@ WORKDIR /opt/oc-drivers
 COPY package.json .
 RUN npm install --production && npm cache clean --force
 
-COPY neo4j.js qdrant.js ./
+COPY neo4j.js qdrant.js ingest.js ./
 
 # Expose the scripts as globally callable commands.
-RUN chmod +x neo4j.js qdrant.js && \
-    ln -s /opt/oc-drivers/neo4j.js /usr/local/bin/neo4j-cli && \
-    ln -s /opt/oc-drivers/qdrant.js /usr/local/bin/qdrant-cli
+RUN chmod +x neo4j.js qdrant.js ingest.js && \
+    ln -s /opt/oc-drivers/neo4j.js   /usr/local/bin/neo4j-cli  && \
+    ln -s /opt/oc-drivers/qdrant.js  /usr/local/bin/qdrant-cli && \
+    ln -s /opt/oc-drivers/ingest.js  /usr/local/bin/ingest-cli
 
 # Reset WORKDIR to /app so the base CMD ("node openclaw.mjs ...") still resolves
 # the relative path correctly.

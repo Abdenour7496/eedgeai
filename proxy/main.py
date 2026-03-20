@@ -52,14 +52,17 @@ Other endpoints
   GET  /health         → liveness check
 """
 
+import hashlib
+import io
 import json
 import logging
 import os
+import uuid
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from neo4j import AsyncGraphDatabase
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -717,8 +720,9 @@ async def list_models():
         models = [
             {"id": OPENAI_CHAT_MODEL,    "object": "model", "owned_by": "openai"},
             {"id": ANTHROPIC_CHAT_MODEL, "object": "model", "owned_by": "anthropic"},
-            {"id": "openclaw",           "object": "model", "owned_by": "eedgeai"},
         ]
+    # Always surface the cognitive RAG model at the top of the list
+    models = [{"id": "openclaw", "object": "model", "created": 1700000000, "owned_by": "eedgeai"}] + models
     return {"object": "list", "data": models}
 
 
@@ -802,6 +806,189 @@ async def chat_completions(request: Request):
         raise HTTPException(status_code=502, detail="Chat completion failed")
 
 
+_TEMPLATES = os.path.join(os.path.dirname(__file__), "templates")
+
+
+# ── Knowledge UI ───────────────────────────────────────────────────────────────
+
+@app.get("/", response_class=RedirectResponse, status_code=302)
+async def root():
+    return "/knowledge"
+
+
+@app.get("/knowledge", response_class=HTMLResponse)
+async def knowledge_ui():
+    with open(os.path.join(_TEMPLATES, "knowledge.html"), encoding="utf-8") as f:
+        return f.read()
+
+
+@app.get("/api/collections")
+async def api_collections():
+    """List all Qdrant collections with Neo4j document stats."""
+    # Fetch Qdrant collections
+    collections = []
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            resp = await c.get(f"{QDRANT_URL}/collections")
+            resp.raise_for_status()
+            for col in resp.json().get("result", {}).get("collections", []):
+                name = col["name"]
+                info_resp = await c.get(f"{QDRANT_URL}/collections/{name}")
+                info = info_resp.json().get("result", {})
+                collections.append({
+                    "name":            name,
+                    "points_count":    info.get("points_count", 0),
+                    "doc_count":       0,
+                    "recent_docs":     [],
+                    "embedding_model": EMBEDDING_MODEL,
+                })
+    except Exception as exc:
+        logger.warning("Qdrant collection fetch failed: %s", exc)
+
+    # If the configured collection is missing from Qdrant, still show it
+    names = {c["name"] for c in collections}
+    if QDRANT_COLLECTION not in names:
+        collections.insert(0, {
+            "name":            QDRANT_COLLECTION,
+            "points_count":    0,
+            "doc_count":       0,
+            "recent_docs":     [],
+            "embedding_model": EMBEDDING_MODEL,
+        })
+
+    # Enrich with Neo4j document counts
+    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    try:
+        async with driver.session(database=NEO4J_DATABASE) as s:
+            result = await s.run(
+                "MATCH (d:Document) "
+                "RETURN d.document_id AS doc_id, d.title AS title, "
+                "       d.created_at AS created_at, d.access_level AS access_level "
+                "ORDER BY d.created_at DESC LIMIT 100"
+            )
+            records = await result.data()
+        doc_count   = len(records)
+        recent_docs = [
+            {"doc_id": r["doc_id"], "title": r["title"] or r["doc_id"],
+             "created_at": r["created_at"], "access_level": r["access_level"]}
+            for r in records[:5]
+        ]
+        for col in collections:
+            if col["name"] == QDRANT_COLLECTION:
+                col["doc_count"]   = doc_count
+                col["recent_docs"] = recent_docs
+    except Exception as exc:
+        logger.warning("Neo4j doc count failed: %s", exc)
+    finally:
+        await driver.close()
+
+    return {"collections": collections, "embedding_model": EMBEDDING_MODEL}
+
+
+@app.get("/api/collections/{name}/docs")
+async def api_collection_docs(name: str):
+    """List all Document nodes in Neo4j for a given collection."""
+    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    try:
+        async with driver.session(database=NEO4J_DATABASE) as s:
+            result = await s.run(
+                "MATCH (d:Document) "
+                "OPTIONAL MATCH (d)-[:CONTAINS]->(c:Chunk) "
+                "RETURN d.document_id AS doc_id, d.title AS title, "
+                "       d.created_at AS created_at, d.access_level AS access_level, "
+                "       count(c) AS chunk_count "
+                "ORDER BY d.created_at DESC LIMIT 200"
+            )
+            records = await result.data()
+        docs = [
+            {"doc_id": r["doc_id"], "title": r["title"] or r["doc_id"],
+             "created_at": r["created_at"], "access_level": r["access_level"],
+             "chunk_count": r["chunk_count"]}
+            for r in records
+        ]
+        return {"collection": name, "docs": docs}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    finally:
+        await driver.close()
+
+
+@app.get("/api/search")
+async def api_search(
+    collection: str = Query(...),
+    q: str = Query(...),
+    top_k: int = Query(8),
+):
+    """Semantic search against a Qdrant collection."""
+    vector = await embed_text(q)
+    if not vector:
+        raise HTTPException(status_code=503, detail="Embedding unavailable — check OPENAI_API_KEY")
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            resp = await c.post(
+                f"{QDRANT_URL}/collections/{collection}/points/search",
+                json={"vector": vector, "limit": top_k, "with_payload": True},
+            )
+            if resp.status_code == 404:
+                return {"results": [], "error": f"Collection '{collection}' not found"}
+            resp.raise_for_status()
+            hits = resp.json().get("result", [])
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    results = [
+        {
+            "score":            h.get("score", 0),
+            "text":             h.get("payload", {}).get("text", ""),
+            "neo4j_element_id": h.get("payload", {}).get("neo4j_element_id", ""),
+            "doc_title":        h.get("payload", {}).get("document_title", ""),
+            "position":         h.get("payload", {}).get("position"),
+        }
+        for h in hits
+    ]
+    return {"collection": collection, "query": q, "results": results}
+
+
+@app.post("/api/ingest")
+async def api_ingest(
+    file: UploadFile = File(...),
+    title: str = Form(""),
+    agent_id: str = Form(""),
+    access_level: str = Form("public"),
+):
+    """JSON-returning ingest endpoint used by the knowledge UI."""
+    filename = file.filename or "upload"
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in _INGEST_ACCEPT:
+        raise HTTPException(status_code=415, detail=f"Unsupported type '{ext}'")
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+    doc_title = title.strip() or filename
+    doc_id    = hashlib.md5(f"{filename}-{datetime.now().isoformat()}".encode()).hexdigest()[:16]
+    try:
+        text = _extract_text(filename, data).strip()
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Extraction failed: {exc}")
+    if not text:
+        raise HTTPException(status_code=422, detail="No text extracted")
+    chunks = _chunk_text(text)
+    if not chunks:
+        raise HTTPException(status_code=422, detail="No chunks produced")
+    logger.info("API ingest '%s': %d chunks", doc_title, len(chunks))
+    try:
+        _, chunk_eids = await _neo4j_ingest(doc_id, doc_title, filename, chunks, agent_id, access_level)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Neo4j: {exc}")
+    try:
+        upserted = await _qdrant_ingest(QDRANT_COLLECTION, chunks, chunk_eids, doc_id, doc_title, agent_id, access_level)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Qdrant: {exc}")
+    return {"status": "ok", "document_id": doc_id, "title": doc_title,
+            "filename": filename, "chunks": len(chunks), "qdrant_points": upserted,
+            "collection": QDRANT_COLLECTION}
+
+
 @app.get("/health")
 async def health():
     return {
@@ -810,3 +997,284 @@ async def health():
         "confidence_threshold": CONFIDENCE_THRESHOLD,
         "agent_id":             AGENT_ID or None,
     }
+
+
+# ── Document Ingest ────────────────────────────────────────────────────────────
+
+_INGEST_ACCEPT = {".txt", ".md", ".pdf", ".docx", ".json", ".csv"}
+
+_UPLOAD_FORM = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>EedgeAI — Ingest Document</title>
+  <style>
+    body{{font-family:system-ui,sans-serif;max-width:640px;margin:60px auto;padding:0 24px;background:#0f172a;color:#e2e8f0}}
+    h1{{color:#38bdf8;margin-bottom:4px}}
+    p{{color:#94a3b8;margin-top:0}}
+    form{{background:#1e293b;padding:28px;border-radius:12px;margin-top:24px}}
+    label{{display:block;font-size:.85rem;color:#94a3b8;margin-bottom:4px}}
+    input,select{{width:100%;padding:8px 12px;border:1px solid #334155;border-radius:6px;
+      background:#0f172a;color:#e2e8f0;font-size:.9rem;box-sizing:border-box;margin-bottom:16px}}
+    button{{background:#0ea5e9;color:#fff;border:none;padding:10px 28px;
+      border-radius:6px;font-size:1rem;cursor:pointer;width:100%}}
+    button:hover{{background:#38bdf8}}
+    .hint{{font-size:.78rem;color:#64748b;margin-top:-12px;margin-bottom:16px}}
+    .accepted{{color:#64748b;font-size:.8rem;margin-top:16px}}
+  </style>
+</head>
+<body>
+  <h1>Ingest Document</h1>
+  <p>Upload a file to index it into Neo4j + Qdrant for GCOR retrieval.</p>
+  <form method="POST" enctype="multipart/form-data">
+    <label>File</label>
+    <input type="file" name="file" accept=".txt,.md,.pdf,.docx,.json,.csv" required>
+    <p class="accepted">Accepted: .txt .md .pdf .docx .json .csv</p>
+    <label>Title (optional — defaults to filename)</label>
+    <input type="text" name="title" placeholder="My Document">
+    <label>Agent ID (optional — leave blank for shared knowledge)</label>
+    <input type="text" name="agent_id" placeholder="">
+    <label>Access level</label>
+    <select name="access_level">
+      <option value="public">public</option>
+      <option value="restricted">restricted</option>
+    </select>
+    <button type="submit">Ingest</button>
+  </form>
+</body>
+</html>"""
+
+_RESULT_TMPL = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Ingest result</title>
+  <style>
+    body{{font-family:system-ui,sans-serif;max-width:640px;margin:60px auto;padding:0 24px;background:#0f172a;color:#e2e8f0}}
+    h1{{color:{color}}}
+    pre{{background:#1e293b;padding:20px;border-radius:8px;overflow-x:auto;font-size:.85rem}}
+    a{{color:#38bdf8}}
+  </style>
+</head>
+<body>
+  <h1>{heading}</h1>
+  <pre>{body}</pre>
+  <p><a href="/ingest">&larr; Ingest another</a></p>
+</body>
+</html>"""
+
+
+def _extract_text(filename: str, data: bytes) -> str:
+    ext = os.path.splitext(filename)[1].lower()
+    if ext == ".pdf":
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(data))
+        return "\n".join(p.extract_text() or "" for p in reader.pages)
+    if ext == ".docx":
+        from docx import Document as DocxDocument
+        doc = DocxDocument(io.BytesIO(data))
+        return "\n".join(p.text for p in doc.paragraphs)
+    if ext == ".json":
+        try:
+            return json.dumps(json.loads(data), indent=2)
+        except Exception:
+            pass
+    return data.decode("utf-8", errors="replace")
+
+
+def _chunk_text(text: str, size: int = 2000, overlap: int = 200) -> list[str]:
+    chunks, start = [], 0
+    while start < len(text):
+        end = min(start + size, len(text))
+        if end < len(text):
+            for sep in ("\n\n", "\n", " "):
+                pos = text.rfind(sep, start + size // 2, end)
+                if pos != -1:
+                    end = pos
+                    break
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        start = end - overlap
+        if start >= len(text) - overlap:
+            break
+    return chunks
+
+
+async def _neo4j_ingest(doc_id: str, title: str, source: str,
+                        chunks: list[str], agent_id: str, access_level: str):
+    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    now = _now_iso()
+    try:
+        async with driver.session(database=NEO4J_DATABASE) as s:
+            doc_rec = await s.run(
+                """CREATE (d:Document {
+                     document_id: $doc_id, title: $title, source: $source,
+                     agent_id: $agent_id, access_level: $access_level,
+                     chunk_count: $cc, created_at: $now
+                   }) RETURN elementId(d) AS eid""",
+                doc_id=doc_id, title=title, source=source,
+                agent_id=agent_id, access_level=access_level,
+                cc=len(chunks), now=now,
+            )
+            doc_eid = (await doc_rec.single())["eid"]
+
+            chunk_eids = []
+            for i, text in enumerate(chunks):
+                cid = f"{doc_id}-chunk-{i}"
+                c_rec = await s.run(
+                    """MATCH (d:Document {document_id: $doc_id})
+                       CREATE (c:Chunk {
+                         chunk_id: $cid, text: $text, position: $pos,
+                         document_id: $doc_id, document_title: $title,
+                         agent_id: $agent_id, access_level: $access_level,
+                         confidence: 1.0, created_at: $now
+                       })
+                       CREATE (d)-[:CONTAINS]->(c)
+                       RETURN elementId(c) AS eid""",
+                    doc_id=doc_id, cid=cid, text=text, pos=i,
+                    title=title, agent_id=agent_id, access_level=access_level, now=now,
+                )
+                chunk_eids.append((await c_rec.single())["eid"])
+        return doc_eid, chunk_eids
+    finally:
+        await driver.close()
+
+
+async def _qdrant_ingest(collection: str, chunks: list[str], chunk_eids: list[str],
+                         doc_id: str, title: str, agent_id: str, access_level: str):
+    now = _now_iso()
+
+    # Embed in batches of 96
+    all_vectors: list[list[float]] = []
+    for i in range(0, len(chunks), 96):
+        batch = chunks[i:i + 96]
+        async with httpx.AsyncClient(timeout=60) as c:
+            resp = await c.post(
+                "https://api.openai.com/v1/embeddings",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                json={"input": batch, "model": EMBEDDING_MODEL},
+            )
+            resp.raise_for_status()
+            data = resp.json()["data"]
+            data.sort(key=lambda x: x["index"])
+            all_vectors.extend(d["embedding"] for d in data)
+
+    # Ensure collection exists
+    async with httpx.AsyncClient(timeout=30) as c:
+        chk = await c.get(f"{QDRANT_URL}/collections/{collection}")
+        if chk.status_code == 404:
+            await c.put(
+                f"{QDRANT_URL}/collections/{collection}",
+                json={"vectors": {"size": len(all_vectors[0]), "distance": "Cosine"}},
+            )
+
+    # Upsert points
+    points = []
+    for i, (text, eid, vec) in enumerate(zip(chunks, chunk_eids, all_vectors)):
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, eid))
+        points.append({
+            "id":      point_id,
+            "vector":  vec,
+            "payload": {
+                "text":             text,
+                "neo4j_element_id": eid,
+                "node_type":        "Chunk",
+                "document_id":      doc_id,
+                "document_title":   title,
+                "position":         i,
+                "agent_id":         agent_id,
+                "access_level":     access_level,
+                "confidence":       1.0,
+                "valid_from":       now,
+                "valid_to":         None,
+            },
+        })
+
+    async with httpx.AsyncClient(timeout=60) as c:
+        resp = await c.put(
+            f"{QDRANT_URL}/collections/{collection}/points",
+            params={"wait": "true"},
+            json={"points": points},
+        )
+        resp.raise_for_status()
+
+    return len(points)
+
+
+@app.get("/ingest", response_class=HTMLResponse)
+async def ingest_form():
+    return _UPLOAD_FORM
+
+
+@app.post("/ingest")
+async def ingest_document(
+    file: UploadFile = File(...),
+    title: str = Form(""),
+    agent_id: str = Form(""),
+    access_level: str = Form("public"),
+):
+    filename = file.filename or "upload"
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in _INGEST_ACCEPT:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type '{ext}'. Accepted: {', '.join(sorted(_INGEST_ACCEPT))}",
+        )
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    doc_title = title.strip() or filename
+    doc_id = hashlib.md5(f"{filename}-{datetime.now().isoformat()}".encode()).hexdigest()[:16]
+
+    try:
+        text = _extract_text(filename, data)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Text extraction failed: {exc}")
+
+    text = text.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="No text could be extracted from the file")
+
+    chunks = _chunk_text(text)
+    if not chunks:
+        raise HTTPException(status_code=422, detail="File produced no chunks after extraction")
+
+    logger.info("Ingest '%s': %d chars → %d chunks", doc_title, len(text), len(chunks))
+
+    try:
+        doc_eid, chunk_eids = await _neo4j_ingest(
+            doc_id, doc_title, filename, chunks, agent_id, access_level
+        )
+    except Exception as exc:
+        logger.error("Neo4j ingest failed: %s", exc)
+        raise HTTPException(status_code=502, detail=f"Neo4j ingest failed: {exc}")
+
+    try:
+        upserted = await _qdrant_ingest(
+            QDRANT_COLLECTION, chunks, chunk_eids, doc_id, doc_title, agent_id, access_level
+        )
+    except Exception as exc:
+        logger.error("Qdrant ingest failed: %s", exc)
+        raise HTTPException(status_code=502, detail=f"Qdrant ingest failed: {exc}")
+
+    result = {
+        "status":        "ok",
+        "document_id":   doc_id,
+        "document_eid":  doc_eid,
+        "title":         doc_title,
+        "filename":      filename,
+        "chunks":        len(chunks),
+        "qdrant_points": upserted,
+        "collection":    QDRANT_COLLECTION,
+    }
+    logger.info("Ingest complete: %s", result)
+
+    return HTMLResponse(_RESULT_TMPL.format(
+        color="#4ade80",
+        heading=f"✓ Ingested \"{doc_title}\"",
+        body=json.dumps(result, indent=2),
+    ))

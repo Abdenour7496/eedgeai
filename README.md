@@ -1,6 +1,6 @@
-# EedgeAI Agentic Stack
+# EedgeAI — Cognitive AI Stack
 
-A unified AI agent stack combining graph database (Neo4j), vector search (Qdrant), RAG orchestration (OpenClaw), and a chat UI (Open WebUI) with monitoring.
+A production-ready AI agent stack built on **GCOR** (Graph-Centric Orchestrated Retrieval): Neo4j as the cognitive backbone, Qdrant as the semantic perception layer, OpenClaw as the agentic interface, and OpenWebUI as the chat frontend — all wired together with a cognitive RAG proxy.
 
 ---
 
@@ -8,67 +8,98 @@ A unified AI agent stack combining graph database (Neo4j), vector search (Qdrant
 
 ```
 User
- └─► Open WebUI (port 8080)
-       └─► Proxy / RAG Pipeline (port 5001)
-             ├─► Qdrant (port 6333)      ← semantic search for context
-             ├─► Neo4j (port 7687)       ← knowledge graph for context
-             └─► LLM API (OpenAI / Anthropic) ← answers with injected context
-
-OpenClaw Agent (ports 18799 / 18801)   ← standalone agent interface (separate from OpenWebUI)
- ├─► MCP Server: Neo4j  (port 8766) ──► Neo4j (port 7687)
- └─► MCP Server: Qdrant (port 8765) ──► Qdrant (port 6333)
+ ├─► Knowledge UI  (localhost:5001)     ← document ingest, search, browse
+ ├─► Open WebUI    (localhost:8080)     ← chat interface
+ │     └─► GCOR Proxy (port 5001)
+ │           ├─► Qdrant  (port 6333)   ← semantic search  (vector perception)
+ │           ├─► Neo4j   (port 7687)   ← knowledge graph  (cognitive backbone)
+ │           └─► LLM API (OpenAI / Anthropic)
+ │
+ └─► OpenClaw Agent (localhost:18799)  ← agentic interface with tools
+       ├─► mcp-qdrant (port 8765)  ──► Qdrant
+       └─► mcp-neo4j  (port 8766)  ──► Neo4j
 
 Monitoring
- ├─► Prometheus (port 9090)
- └─► Grafana (port 3000)
+ ├─► Prometheus (localhost:9090)
+ └─► Grafana    (localhost:3000)
 ```
 
-### How OpenWebUI gets RAG context (proxy pipeline)
+### GCOR Retrieval Pipeline (every chat message via OpenWebUI)
 
-The proxy at port 5001 is the core RAG engine for OpenWebUI:
+1. **Intent classification** — keyword-based: `factual | planning | dependency | memory | semantic | inference | belief`
+2. **Semantic phase** — embed query → top-K Qdrant hits, filtered by confidence, temporal validity, and access level
+3. **Structural phase** — intent-specific Neo4j Cypher expansion using the `neo4j_element_id` from each Qdrant hit
+4. **Reflection check** — fallback to chunk text when graph is empty; pure LLM when both are empty
+5. **Context injection** — structured system message with confidence scores, temporal badges, reasoning traces
+6. **LLM call** — forwarded to OpenAI or Anthropic with enriched context
 
-1. **Embed** — the user's message is embedded using `text-embedding-3-small` (OpenAI)
-2. **Qdrant search** — the proxy queries Qdrant for the top-k most similar document chunks
-3. **Neo4j search** — the proxy queries Neo4j for nodes whose properties match the query keywords
-4. **Context injection** — retrieved chunks and graph nodes are prepended as a system message
-5. **LLM call** — the enriched request is forwarded to OpenAI or Anthropic and the response is streamed back
+### Cognitive Infrastructure
 
-The proxy also handles `/v1/embeddings` so OpenWebUI's own built-in RAG (for uploaded documents) works correctly.
+Every node in Neo4j and every vector point in Qdrant carries:
 
-### OpenClaw (separate agent interface)
+| Property | Purpose |
+|---|---|
+| `confidence` | Float 0.0–1.0 — certainty score, filterable at query time |
+| `valid_from` / `valid_to` | ISO-8601 temporal validity window — expired knowledge is excluded |
+| `agent_id` | Agent partition — scopes memory/belief/inference to one agent |
+| `access_level` | ACL: `public` \| `restricted` \| `agent:<id>` |
 
-OpenClaw is a standalone AI coding assistant. It connects to Neo4j and Qdrant through MCP sidecar
-services (`mcp-qdrant`, `mcp-neo4j`). Its web interface is available at `http://localhost:18801`.
-It operates independently of OpenWebUI.
+Cognitive node types supported in Neo4j:
+
+| Label | Description |
+|---|---|
+| `:Document` | Ingested source document |
+| `:Chunk` | Text segment of a Document, linked via `CONTAINS` |
+| `:Memory` | Agent observations, reflections, plans, facts |
+| `:Inference` | Reasoned conclusion with `reasoning_trace` and `DERIVED_FROM` sources |
+| `:Belief` | Agent epistemic state with `HOLDS`, `ABOUT`, and `CONTRADICTS` relationships |
+| `:Goal` | Agent objectives |
+| `:Event` | Timestamped occurrences |
+| `:Concept` | Named concepts linked to memories and beliefs |
 
 ---
 
 ## Prerequisites
 
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running
-- At least 8 GB RAM allocated to Docker
-- Ports 3000, 5001, 6333, 7474, 7687, 8080, 9090, 18799, 18801 free on your machine
+- At least **8 GB RAM** allocated to Docker
+- Ports `3000, 5001, 6333, 7474, 7687, 8080, 9090, 18799, 18801` free
 
 ---
 
 ## Step 1 — Configure Environment Variables
 
-Copy `.env` and fill in your credentials:
+Copy `.env.example` and fill in your credentials:
 
 ```bash
-cp .env .env.local   # or edit .env directly
+cp .env.example .env
 ```
 
 Required variables:
 
 | Variable | Description |
 |---|---|
-| `ANTHROPIC_API_KEY` | Anthropic API key |
-| `OPENAI_API_KEY` | OpenAI API key (also used for embeddings) |
+| `OPENAI_API_KEY` | OpenAI API key — used for LLM calls and embeddings |
+| `ANTHROPIC_API_KEY` | Anthropic API key — optional fallback LLM |
 | `OPENCLAW_GATEWAY_TOKEN` | Token for OpenClaw gateway authentication |
 | `OPENCLAW_GATEWAY_PASSWORD` | Password for OpenClaw gateway |
 
-> **Security:** Never commit `.env` to version control. Add it to `.gitignore`.
+Optional cognitive knobs:
+
+| Variable | Default | Description |
+|---|---|---|
+| `LLM_BACKEND` | `openai` | Primary LLM: `openai` or `anthropic` |
+| `OPENAI_CHAT_MODEL` | `gpt-4o` | OpenAI model for chat completions |
+| `ANTHROPIC_CHAT_MODEL` | `claude-sonnet-4-6` | Anthropic model for chat completions |
+| `EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI embedding model |
+| `QDRANT_COLLECTION` | `documents` | Default Qdrant collection name |
+| `QDRANT_TOP_K` | `8` | Number of semantic search results |
+| `ENABLE_RAG` | `true` | Set `false` to disable GCOR and use plain LLM |
+| `CONFIDENCE_THRESHOLD` | `0.0` | Drop knowledge below this confidence (0.0–1.0) |
+| `AGENT_ID` | _(empty)_ | Scope retrieval to a specific agent partition |
+| `DEFAULT_ACCESS_LEVEL` | `public` | Default ACL for new nodes |
+
+> **Security:** Never commit `.env` to version control.
 
 ---
 
@@ -77,195 +108,179 @@ Required variables:
 ```
 eedgeai/
 ├── docker-compose.unified.yml
-├── .env
+├── .env.example
 ├── openclaw-config/
-│   └── openclaw.json          ← MCP server wiring (Qdrant + Neo4j)
+│   └── openclaw.json              ← OpenClaw config (gateway mode + default model)
+├── openclaw/
+│   ├── Dockerfile                 ← extends openclaw base image
+│   ├── package.json               ← neo4j-driver, qdrant client, pdf-parse, mammoth
+│   ├── neo4j.js                   ← neo4j-cli  (shell tool for OpenClaw agent)
+│   ├── qdrant.js                  ← qdrant-cli (shell tool for OpenClaw agent)
+│   └── ingest.js                  ← ingest-cli (document ingestion tool)
+├── openclaw-relay/
+│   └── relay.js                   ← TCP relay: 18799→18789, 18801→18790
 ├── mcp-servers/
 │   ├── qdrant/
-│   │   └── Dockerfile         ← mcp-server-qdrant (SSE on :8765)
+│   │   ├── Dockerfile
+│   │   └── server.py              ← GCOR-aware MCP server for Qdrant (SSE :8765)
 │   └── neo4j/
-│       └── Dockerfile         ← mcp-neo4j-cypher  (SSE on :8766)
+│       ├── Dockerfile
+│       └── server.py              ← Cognitive MCP server for Neo4j (SSE :8766)
 ├── proxy/
 │   ├── Dockerfile
-│   ├── main.py
-│   └── requirements.txt
-├── openclaw-relay/
-│   └── relay.js
+│   ├── main.py                    ← GCOR proxy + Knowledge UI + ingest API
+│   ├── requirements.txt
+│   └── templates/
+│       └── knowledge.html         ← Knowledge management UI
 ├── monitoring/
 │   ├── prometheus.yml
 │   ├── grafana-dashboard.json
 │   └── grafana-provisioning/
-│       ├── datasources/
-│       │   └── prometheus.yaml
-│       └── dashboards/
-│           └── default.yaml
 └── agentic-stack/
     └── agentic_stack/
-        ├── config/
-        │   ├── agents.yaml
-        │   └── model_registry.yaml
-        └── ingestion/
-            └── ingest.py
+        └── graph/
+            └── schema.py          ← Neo4j constraints and indexes
 ```
 
 ---
 
 ## Step 3 — Start the Stack
 
-Open a terminal in the `eedgeai/` folder and run:
-
 ```bash
 docker compose -f docker-compose.unified.yml up -d
 ```
 
-The first run will pull all images and build the proxy (~5–10 minutes depending on internet speed).
+First run pulls all images and builds custom containers (~5–10 min). Services start in dependency order: Neo4j and Qdrant → MCP servers → OpenClaw → Proxy → OpenWebUI.
 
-Services start in dependency order: Neo4j and Qdrant become healthy first, then OpenClaw, then the proxy, then Open WebUI.
-
-To watch logs in real time:
-
+Watch logs:
 ```bash
 docker compose -f docker-compose.unified.yml logs -f
 ```
 
 ---
 
-## Step 4 — Verify All Services Are Running
+## Step 4 — Verify All Services
 
 ```bash
 docker compose -f docker-compose.unified.yml ps
 ```
 
-All 10 services should show `Up` or `healthy`:
-
-| Service         | Port            | Description                                        |
-|-----------------|-----------------|----------------------------------------------------|
-| openwebui       | 8080            | Chat UI                                            |
-| proxy           | 5001            | RAG pipeline — embeds, retrieves, calls LLM        |
-| openclaw        | 18799, 18801    | Standalone AI agent (its own chat interface)       |
-| openclaw-relay  | (shared)        | TCP relay (18799→18789, 18801→18790)               |
-| mcp-qdrant      | 8765 (internal) | MCP server — exposes Qdrant to OpenClaw agent      |
-| mcp-neo4j       | 8766 (internal) | MCP server — exposes Neo4j to OpenClaw agent       |
-| neo4j           | 7474, 7687      | Graph database                                     |
-| quarant         | 6333            | Qdrant vector database                             |
-| prometheus      | 9090            | Metrics collection                                 |
-| grafana         | 3000            | Metrics dashboard                                  |
+| Service | Port(s) | Description |
+|---|---|---|
+| `openwebui` | 8080 | Chat UI — select **openclaw** model |
+| `proxy` | 5001 | GCOR pipeline + Knowledge UI |
+| `openclaw` | 18799 | OpenClaw agent web interface |
+| `openclaw-relay` | (shared) | TCP relay (18799→18789, 18801→18790) |
+| `mcp-qdrant` | 8765 (internal) | MCP server — Qdrant tools for OpenClaw |
+| `mcp-neo4j` | 8766 (internal) | MCP server — Neo4j tools for OpenClaw |
+| `neo4j` | 7474, 7687 | Graph database |
+| `qdrant` | 6333 | Vector database |
+| `prometheus` | 9090 | Metrics collection |
+| `grafana` | 3000 | Metrics dashboard |
 
 ---
 
-## Step 5 — Access the Chat UI
+## Step 5 — Ingest Documents
 
-Open your browser and go to:
+### Via the Knowledge UI (recommended)
 
-```
-http://localhost:8080
-```
+Open **http://localhost:5001** in your browser. It redirects to the Knowledge page:
 
-1. Create an account on the first visit (local only, no internet required).
-2. The UI is pre-configured to route queries through the proxy to OpenClaw.
-3. Select the **openclaw** model from the model dropdown.
-4. Start chatting — queries are answered using the knowledge graph and vector store.
+- **Cards** show each Qdrant collection with document count, chunk count, and recent files
+- **Ingest button** — drag-and-drop or click to upload; supports `.txt` `.md` `.pdf` `.docx` `.json` `.csv`
+- **Test button** — run a semantic search query against the collection
+- **View button** — browse all ingested documents with chunk counts and timestamps
 
----
+Each upload:
+1. Extracts text from the file
+2. Chunks it into ~2000-character segments with overlap
+3. Creates a `:Document` node → `:Chunk` nodes in Neo4j (linked via `CONTAINS`)
+4. Embeds each chunk and upserts it to Qdrant with the Neo4j `elementId` as `neo4j_element_id`
 
-## Step 6 — Ingest Data (Optional)
+### Via OpenClaw agent (ingest-cli)
 
-To populate the vector store with your own documents, use the ingestion script:
+Inside the OpenClaw chat, ask the agent to ingest a file using the built-in `ingest-cli` tool:
 
 ```bash
-cd eedgeai/agentic-stack/agentic_stack/ingestion
+# Ingest a file from the workspace
+ingest-cli /path/to/document.pdf --title "Q4 Report"
 
-# Install dependencies first
-pip install httpx pyyaml openai          # for OpenAI/Azure models
-pip install sentence-transformers        # for local models
+# Ingest a Word document
+ingest-cli /path/to/spec.docx --title "Technical Spec"
 
-# Ingest a directory of documents (txt, md, json, yaml)
-python ingest.py --input ./docs --model openai_large
+# Ingest with agent scoping and access control
+ingest-cli /path/to/doc.txt --agent-id "my-agent" --access-level restricted
 
-# Use a local model (no API key needed)
-python ingest.py --input ./docs --model sentence_transformer
-
-# Target a specific Qdrant collection
-python ingest.py --input ./docs --model openai_large --collection my_docs
+# Pipe text directly
+echo "content here" | ingest-cli --stdin --title "Quick Note"
 ```
 
-The script:
-1. Reads all `.txt`, `.md`, `.rst`, `.json`, `.yaml` files under `--input`
-2. Splits them into overlapping chunks
-3. Embeds each chunk using the selected model
-4. Creates the Qdrant collection if it doesn't exist
-5. Upserts all vectors with filename + text as payload
+### Via API
 
-Available embedding models (configured in `config/agents.yaml`):
-
-| Model Key              | Type             | Description                    |
-|------------------------|------------------|--------------------------------|
-| `openai_large`         | OpenAI API       | text-embedding-3-large         |
-| `openai_small`         | OpenAI API       | text-embedding-3-small         |
-| `sentence_transformer` | Local            | all-MiniLM-L6-v2 (no API key) |
-| `code_embedding`       | Local            | codebert-base                  |
-| `azure_openai`         | Azure OpenAI API | text-embedding-3-large         |
-
-Environment variables used by the ingestion script:
-
-| Variable | Default | Description |
-|---|---|---|
-| `QDRANT_URL` | `http://localhost:6333` | Qdrant endpoint |
-| `QDRANT_COLLECTION` | `documents` | Default collection name |
-| `OPENAI_API_KEY` | — | Required for OpenAI/Azure models |
-
-To change the default active model, edit `config/agents.yaml`:
-
-```yaml
-active_model: sentence_transformer
+```bash
+curl -X POST http://localhost:5001/api/ingest \
+  -F "file=@report.pdf" \
+  -F "title=Q4 Report" \
+  -F "access_level=public"
 ```
 
 ---
 
-## Step 7 — Browse the Knowledge Graph (Neo4j)
+## Step 6 — Chat via OpenWebUI
 
-Open your browser and go to:
+Open **http://localhost:8080**:
 
-```
-http://localhost:7474
-```
+1. Create an account on first visit
+2. Select **openclaw** from the model dropdown
+3. Every message is automatically enriched via the GCOR pipeline before reaching the LLM
 
-- **Username:** `neo4j`
-- **Password:** `test1234`
+---
 
-Run Cypher queries to explore the graph, e.g.:
+## Step 7 — Chat via OpenClaw
+
+Open **http://localhost:18799**:
+
+- Full agentic interface with tool use
+- Native access to `neo4j-cli`, `qdrant-cli`, and `ingest-cli` as shell tools
+- Connects to Neo4j and Qdrant via MCP sidecar servers
+- Default model: `openai/gpt-4o` (configured in `openclaw-config/openclaw.json`)
+
+---
+
+## Step 8 — Browse the Knowledge Graph
+
+Open **http://localhost:7474** (Neo4j Browser):
+- **Username:** `neo4j` · **Password:** `test1234`
+
+Useful Cypher queries:
 
 ```cypher
-MATCH (n) RETURN n LIMIT 25
+// All documents
+MATCH (d:Document) RETURN d ORDER BY d.created_at DESC
+
+// Document with its chunks
+MATCH (d:Document)-[:CONTAINS]->(c:Chunk)
+WHERE d.title CONTAINS "report"
+RETURN d, c
+
+// All cognitive nodes for an agent
+MATCH (n) WHERE n.agent_id = "my-agent"
+RETURN labels(n), n.confidence, n.created_at LIMIT 50
 ```
 
 ---
 
-## Step 8 — Monitor the Stack (Grafana)
+## Step 9 — Monitor (Grafana)
 
-Open your browser and go to:
+Open **http://localhost:3000** · admin / admin
 
-```
-http://localhost:3000
-```
-
-- **Username:** `admin`
-- **Password:** `admin` (you will be prompted to change on first login)
-
-The **Agent System Metrics** dashboard is auto-provisioned on startup. It includes:
-
-- Service up/down status for proxy, Neo4j, OpenClaw, and Qdrant
-- HTTP request rate through the proxy
-- HTTP 5xx error rate
-
-Prometheus scrapes metrics from:
+The **Agent System Metrics** dashboard is auto-provisioned. Prometheus scrapes:
 
 | Target | Job |
 |---|---|
 | `proxy:5001` | `proxy` |
 | `neo4j:2004` | `neo4j` |
-| `openclaw:9091` | `openclaw` |
-| `quarant:6333` | `qdrant` |
+| `qdrant:6333` | `qdrant` |
 
 ---
 
@@ -273,86 +288,83 @@ Prometheus scrapes metrics from:
 
 ```bash
 docker compose -f docker-compose.unified.yml down
-```
 
-To also remove all stored data (volumes):
-
-```bash
+# Also remove all stored data
 docker compose -f docker-compose.unified.yml down -v
 ```
 
 ---
 
-## Restarting / Updating
+## Rebuilding After Code Changes
 
 ```bash
-# Pull latest images and restart
-docker compose -f docker-compose.unified.yml pull
-docker compose -f docker-compose.unified.yml up -d --build
+docker compose -f docker-compose.unified.yml build <service>
+docker compose -f docker-compose.unified.yml up -d <service>
+
+# After restarting openclaw, always recreate the relay:
+docker compose -f docker-compose.unified.yml up -d --force-recreate openclaw-relay
 ```
+
+> ⚠️ **Important:** Every time the `openclaw` container restarts, the `openclaw-relay` must be force-recreated. The relay shares openclaw's network namespace — when openclaw gets a new namespace on restart, the relay's reference goes stale (`ERR_EMPTY_RESPONSE` on port 18799). Always run the force-recreate command above after any openclaw restart.
 
 ---
 
 ## Troubleshooting
 
-**A container keeps restarting:**
+**OpenClaw shows `ERR_EMPTY_RESPONSE` on port 18799:**
 ```bash
-docker compose -f docker-compose.unified.yml logs <service-name>
-# e.g.
-docker compose -f docker-compose.unified.yml logs openclaw
+docker compose -f docker-compose.unified.yml up -d --force-recreate openclaw-relay
 ```
+This happens every time the `openclaw` container is restarted. The relay must be recreated to attach to the new network namespace.
 
-**Port already in use:**
-Edit `docker-compose.unified.yml` and change the left-hand port number, e.g. `"8081:8080"` for Open WebUI.
-
-**OpenWebUI shows no models:**
-Confirm the proxy is running and healthy:
+**OpenWebUI shows no models / only one model:**
+```bash
+curl http://localhost:5001/v1/models | python3 -m json.tool | grep '"id"' | head -3
+```
+The first model should be `"openclaw"`. If not, check that the proxy is healthy:
 ```bash
 curl http://localhost:5001/health
-curl http://localhost:5001/v1/models
 ```
-Expected response from `/v1/models`: `{"object":"list","data":[{"id":"openclaw",...}]}`
 
-If the proxy can't reach OpenClaw it will return a fallback model list and log a warning — check proxy logs:
+**Knowledge UI shows no collections:**
+The `documents` Qdrant collection is created automatically on first ingest. If Qdrant was wiped, ingest any document via the Knowledge UI to recreate it.
+
+**Qdrant search returns 0 results:**
 ```bash
-docker compose -f docker-compose.unified.yml logs proxy
+curl http://localhost:6333/collections/documents
 ```
+Check `points_count`. If 0, the collection exists but is empty — ingest documents first.
 
 **Neo4j connection refused:**
-Neo4j can take 30–60 seconds to fully initialise. The stack uses health checks so dependent services wait automatically, but you may still need to wait before hitting port 7474 from your browser.
-
-**Grafana shows no data:**
-- Confirm Prometheus is up: `http://localhost:9090/targets`
-- All targets should show `UP`. If a target is down, check that the relevant container is running.
-
-**OpenWebUI chat has no RAG context (answers don't use Neo4j / Qdrant data):**
-
-The proxy handles RAG automatically — each chat message triggers an embed + Qdrant search + Neo4j lookup before calling the LLM. Check the proxy logs to see what's happening:
+Neo4j takes 30–60 s to initialise. Wait and retry. Check health:
 ```bash
-docker compose -f docker-compose.unified.yml logs proxy
+docker compose -f docker-compose.unified.yml logs neo4j | tail -20
 ```
-You should see lines like:
-```
-INFO: Qdrant: 5 chunk(s) retrieved
-INFO: Neo4j:  2 node(s) retrieved
-```
-If Qdrant returns 0 chunks, the collection is likely empty — run the ingestion script first (see Step 6).
-If Neo4j returns 0 nodes, the graph is empty — add data via the Neo4j browser at `http://localhost:7474`.
-To disable RAG temporarily (answer without context), set `ENABLE_RAG=false` in `.env` and restart the proxy.
 
-**OpenClaw can't query Neo4j or Qdrant (OpenClaw's own interface):**
+**OpenClaw LLM errors (credit / billing):**
+OpenClaw defaults to `openai/gpt-4o`. To switch models:
+```bash
+# From inside the container
+docker exec eedgeai-openclaw-1 openclaw models set openai/gpt-4o
+# Or edit openclaw-config/openclaw.json:
+# { "gateway": { "mode": "local" }, "agents": { "defaults": { "model": "openai/gpt-4o" } } }
+```
+> Note: `openclaw-config/openclaw.json` is mounted read-only. Edit the host file and restart openclaw + relay.
 
-OpenClaw uses MCP sidecar services for its native interface. Check them:
+**MCP servers not responding (OpenClaw tools fail):**
 ```bash
 docker compose -f docker-compose.unified.yml logs mcp-qdrant
 docker compose -f docker-compose.unified.yml logs mcp-neo4j
-```
-If they failed to start, restart them:
-```bash
 docker compose -f docker-compose.unified.yml restart mcp-qdrant mcp-neo4j
 ```
 
-**Ingestion script fails:**
-- Ensure required pip packages are installed (`openai`, `httpx`, `pyyaml`, or `sentence-transformers` depending on the model).
-- For OpenAI models, confirm `OPENAI_API_KEY` is set in your environment.
-- Confirm Qdrant is reachable at `QDRANT_URL` (default `http://localhost:6333`).
+**RAG returns 0 context (proxy logs show 0 chunks / 0 records):**
+```bash
+docker compose -f docker-compose.unified.yml logs proxy --tail 20
+```
+- `Qdrant collection 'documents' not found` → ingest at least one document
+- `Neo4j: 0 graph records expanded` → graph is empty, ingest documents first
+- To disable RAG temporarily: set `ENABLE_RAG=false` in `.env` and restart the proxy
+
+**Grafana shows no data:**
+Check Prometheus targets at `http://localhost:9090/targets` — all should show `UP`.

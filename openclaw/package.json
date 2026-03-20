@@ -5,6 +5,8 @@
   "description": "Neo4j and Qdrant driver layer for OpenClaw",
   "dependencies": {
     "neo4j-driver": "^5.27.0",
-    "@qdrant/js-client-rest": "^1.13.0"
+    "@qdrant/js-client-rest": "^1.13.0",
+    "pdf-parse": "^1.1.1",
+    "mammoth": "^1.8.0"
   }
 }
