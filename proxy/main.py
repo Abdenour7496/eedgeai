@@ -57,6 +57,7 @@ import io
 import json
 import logging
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -64,11 +65,79 @@ import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from neo4j import AsyncGraphDatabase
+from prometheus_client import Counter, Histogram
+from prometheus_fastapi_instrumentator import Instrumentator
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+# ── Prometheus metrics ─────────────────────────────────────────────────────────
+
+# Auto-instruments HTTP request count + latency for every FastAPI endpoint
+Instrumentator().instrument(app).expose(app)
+
+# GCOR RAG pipeline
+METRIC_RAG_REQUESTS = Counter(
+    "gcor_rag_requests_total",
+    "Total GCOR RAG pipeline invocations",
+    ["intent", "fallback_mode"],
+)
+METRIC_RAG_DURATION = Histogram(
+    "gcor_rag_duration_seconds",
+    "End-to-end GCOR pipeline latency (embed → Qdrant → Neo4j → context build)",
+    buckets=[0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0],
+)
+METRIC_QDRANT_HITS = Histogram(
+    "gcor_qdrant_hits",
+    "Number of Qdrant hits returned per RAG request (after cognitive filters)",
+    buckets=[0, 1, 2, 3, 4, 5, 6, 8, 10, 15, 20],
+)
+METRIC_NEO4J_RECORDS = Histogram(
+    "gcor_neo4j_records",
+    "Number of Neo4j graph records expanded per RAG request",
+    buckets=[0, 1, 2, 5, 10, 15, 20, 30, 50],
+)
+
+# Embedding
+METRIC_EMBED_DURATION = Histogram(
+    "gcor_embed_duration_seconds",
+    "OpenAI embedding API call latency",
+    buckets=[0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0],
+)
+
+# LLM calls
+METRIC_LLM_REQUESTS = Counter(
+    "gcor_llm_requests_total",
+    "Total LLM API calls",
+    ["backend", "status"],
+)
+METRIC_LLM_DURATION = Histogram(
+    "gcor_llm_duration_seconds",
+    "LLM API call latency (non-streaming only)",
+    ["backend"],
+    buckets=[0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 60.0, 120.0],
+)
+
+# Ingest
+METRIC_INGEST_TOTAL = Counter(
+    "gcor_ingest_total",
+    "Total document ingest operations",
+    ["status"],
+)
+METRIC_INGEST_CHUNKS = Histogram(
+    "gcor_ingest_chunks",
+    "Number of chunks produced per ingested document",
+    buckets=[1, 5, 10, 20, 50, 100, 200, 500],
+)
+
+# Collection management
+METRIC_COLLECTION_OPS = Counter(
+    "gcor_collection_ops_total",
+    "Qdrant collection management operations",
+    ["operation"],
+)
 
 # ── LLM backends ───────────────────────────────────────────────────────────────
 OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
@@ -138,6 +207,7 @@ async def embed_text(text: str) -> list | None:
     if not OPENAI_API_KEY:
         return None
     try:
+        t0 = time.monotonic()
         async with httpx.AsyncClient(timeout=30) as c:
             resp = await c.post(
                 "https://api.openai.com/v1/embeddings",
@@ -145,7 +215,9 @@ async def embed_text(text: str) -> list | None:
                 json={"input": text[:8000], "model": EMBEDDING_MODEL},
             )
             resp.raise_for_status()
-            return resp.json()["data"][0]["embedding"]
+            embedding = resp.json()["data"][0]["embedding"]
+        METRIC_EMBED_DURATION.observe(time.monotonic() - t0)
+        return embedding
     except Exception as exc:
         logger.warning("Embedding failed: %s", exc)
         return None
@@ -618,26 +690,37 @@ async def call_openai(body: dict):
     if body.get("stream"):
         async def stream():
             try:
+                METRIC_LLM_REQUESTS.labels(backend="openai", status="started").inc()
                 async with httpx.AsyncClient(timeout=120) as c:
                     async with c.stream("POST", "https://api.openai.com/v1/chat/completions",
                                         json=body, headers=headers) as resp:
                         if resp.status_code != 200:
                             err = await resp.aread()
                             logger.error("OpenAI %s: %s", resp.status_code, err[:200])
+                            METRIC_LLM_REQUESTS.labels(backend="openai", status="error").inc()
                             yield f'data: {{"error": "OpenAI {resp.status_code}"}}\n\n'.encode()
                             return
+                        METRIC_LLM_REQUESTS.labels(backend="openai", status="success").inc()
                         async for chunk in resp.aiter_bytes():
                             yield chunk
             except Exception as exc:
                 logger.error("OpenAI stream error: %s", exc)
+                METRIC_LLM_REQUESTS.labels(backend="openai", status="exception").inc()
                 yield b'data: {"error": "proxy error"}\n\n'
         return StreamingResponse(stream(), media_type="text/event-stream")
     else:
-        async with httpx.AsyncClient(timeout=120) as c:
-            resp = await c.post("https://api.openai.com/v1/chat/completions",
-                                json=body, headers=headers)
-            resp.raise_for_status()
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=120) as c:
+                resp = await c.post("https://api.openai.com/v1/chat/completions",
+                                    json=body, headers=headers)
+                resp.raise_for_status()
+            METRIC_LLM_REQUESTS.labels(backend="openai", status="success").inc()
+            METRIC_LLM_DURATION.labels(backend="openai").observe(time.monotonic() - t0)
             return JSONResponse(content=resp.json(), status_code=resp.status_code)
+        except Exception:
+            METRIC_LLM_REQUESTS.labels(backend="openai", status="error").inc()
+            raise
 
 
 async def call_anthropic(body: dict):
@@ -655,14 +738,17 @@ async def call_anthropic(body: dict):
         ant_body["stream"] = True
         async def stream():
             try:
+                METRIC_LLM_REQUESTS.labels(backend="anthropic", status="started").inc()
                 async with httpx.AsyncClient(timeout=120) as c:
                     async with c.stream("POST", "https://api.anthropic.com/v1/messages",
                                         json=ant_body, headers=headers) as resp:
                         if resp.status_code != 200:
                             err = await resp.aread()
                             logger.error("Anthropic %s: %s", resp.status_code, err[:200])
+                            METRIC_LLM_REQUESTS.labels(backend="anthropic", status="error").inc()
                             yield f'data: {{"error": "Anthropic {resp.status_code}"}}\n\n'.encode()
                             return
+                        METRIC_LLM_REQUESTS.labels(backend="anthropic", status="success").inc()
                         async for line in resp.aiter_lines():
                             if not line.startswith("data: "):
                                 continue
@@ -680,13 +766,18 @@ async def call_anthropic(body: dict):
                                 pass
             except Exception as exc:
                 logger.error("Anthropic stream error: %s", exc)
+                METRIC_LLM_REQUESTS.labels(backend="anthropic", status="exception").inc()
                 yield b'data: {"error": "proxy error"}\n\n'
         return StreamingResponse(stream(), media_type="text/event-stream")
     else:
-        async with httpx.AsyncClient(timeout=120) as c:
-            resp = await c.post("https://api.anthropic.com/v1/messages",
-                                json=ant_body, headers=headers)
-            resp.raise_for_status()
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=120) as c:
+                resp = await c.post("https://api.anthropic.com/v1/messages",
+                                    json=ant_body, headers=headers)
+                resp.raise_for_status()
+            METRIC_LLM_REQUESTS.labels(backend="anthropic", status="success").inc()
+            METRIC_LLM_DURATION.labels(backend="anthropic").observe(time.monotonic() - t0)
             ant = resp.json()
             usage = ant.get("usage", {})
             return JSONResponse(content={
@@ -700,6 +791,9 @@ async def call_anthropic(body: dict):
                           "completion_tokens": usage.get("output_tokens", 0),
                           "total_tokens":      usage.get("input_tokens", 0) + usage.get("output_tokens", 0)},
             })
+        except Exception:
+            METRIC_LLM_REQUESTS.labels(backend="anthropic", status="error").inc()
+            raise
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -755,12 +849,17 @@ async def chat_completions(request: Request):
     body     = await request.json()
     messages = list(body.get("messages", []))
 
+    rag_intent   = "none"
+    rag_fallback = "disabled"
+    rag_t0       = time.monotonic()
+
     if ENABLE_RAG and messages:
         query = last_user_text(messages)
 
         if query:
             # ── Step 1: Intent ──────────────────────────────────────────────
-            intent = classify_intent(query)
+            intent     = classify_intent(query)
+            rag_intent = intent
             logger.info("GCOR intent: %s", intent)
 
             # ── Step 2a: Semantic (Qdrant → element IDs) ────────────────────
@@ -772,6 +871,7 @@ async def chat_completions(request: Request):
                 for h in qdrant_hits
                 if h.get("payload", {}).get("neo4j_element_id")
             ]
+            METRIC_QDRANT_HITS.observe(len(qdrant_hits))
             logger.info(
                 "Qdrant: %d raw → %d after cognitive filters, %d with neo4j_element_id",
                 len(raw_hits), len(qdrant_hits), len(element_ids),
@@ -779,12 +879,25 @@ async def chat_completions(request: Request):
 
             # ── Step 2b: Structural (Neo4j graph expansion) ─────────────────
             graph_records = await neo4j_expand(element_ids, intent, query)
+            METRIC_NEO4J_RECORDS.observe(len(graph_records))
             logger.info("Neo4j: %d graph records expanded", len(graph_records))
 
             # ── Step 3: Reflection + context build ──────────────────────────
             context  = build_gcor_context(intent, qdrant_hits, graph_records)
+
+            # Determine fallback mode for metrics
+            if graph_records:
+                rag_fallback = "full_gcor"
+            elif qdrant_hits:
+                rag_fallback = "qdrant_text"
+            else:
+                rag_fallback = "llm_only"
+
             messages = inject_context(messages, context)
             body     = {**body, "messages": messages}
+
+        METRIC_RAG_REQUESTS.labels(intent=rag_intent, fallback_mode=rag_fallback).inc()
+        METRIC_RAG_DURATION.observe(time.monotonic() - rag_t0)
 
     # ── Route to LLM ──────────────────────────────────────────────────────────
     model, backend = _resolve_model(body.get("model", "openclaw"))
@@ -931,6 +1044,7 @@ async def api_create_collection(request: Request):
             json={"vectors": {"size": vec_size, "distance": distance}},
         )
         resp.raise_for_status()
+    METRIC_COLLECTION_OPS.labels(operation="create").inc()
     return {"status": "ok", "name": name}
 
 
@@ -989,6 +1103,7 @@ async def api_rename_collection(name: str, request: Request):
 
         await c.delete(f"{QDRANT_URL}/collections/{name}")
 
+    METRIC_COLLECTION_OPS.labels(operation="rename").inc()
     return {"status": "ok", "name": new_name, "points_copied": total}
 
 
@@ -1068,6 +1183,7 @@ async def api_archive_collection(name: str):
     finally:
         await driver.close()
 
+    METRIC_COLLECTION_OPS.labels(operation="archive").inc()
     return {
         "status":        "archived",
         "archive_name":  archive_qname,
@@ -1203,6 +1319,7 @@ async def api_restore_archive(archive_name: str, request: Request):
     finally:
         await driver.close()
 
+    METRIC_COLLECTION_OPS.labels(operation="restore").inc()
     return {"status": "restored", "name": target_name, "points_restored": total}
 
 
@@ -1272,11 +1389,15 @@ async def api_ingest(
     try:
         _, chunk_eids = await _neo4j_ingest(doc_id, doc_title, filename, chunks, agent_id, access_level)
     except Exception as exc:
+        METRIC_INGEST_TOTAL.labels(status="neo4j_error").inc()
         raise HTTPException(status_code=502, detail=f"Neo4j: {exc}")
     try:
         upserted = await _qdrant_ingest(QDRANT_COLLECTION, chunks, chunk_eids, doc_id, doc_title, agent_id, access_level)
     except Exception as exc:
+        METRIC_INGEST_TOTAL.labels(status="qdrant_error").inc()
         raise HTTPException(status_code=502, detail=f"Qdrant: {exc}")
+    METRIC_INGEST_TOTAL.labels(status="success").inc()
+    METRIC_INGEST_CHUNKS.observe(len(chunks))
     return {"status": "ok", "document_id": doc_id, "title": doc_title,
             "filename": filename, "chunks": len(chunks), "qdrant_points": upserted,
             "collection": QDRANT_COLLECTION}

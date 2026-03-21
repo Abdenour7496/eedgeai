@@ -1,19 +1,24 @@
 
-# Prometheus scrape configuration
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
 scrape_configs:
-  - job_name: 'neo4j'
-    static_configs:
-      - targets: ['neo4j:2004']
-
-  - job_name: 'openclaw'
-    static_configs:
-      - targets: ['openclaw:9091']
-
   - job_name: 'proxy'
     metrics_path: /metrics
     static_configs:
       - targets: ['proxy:5001']
 
   - job_name: 'qdrant'
+    metrics_path: /metrics
     static_configs:
       - targets: ['qdrant:6333']
+
+  # neo4j: Prometheus metrics require Neo4j Enterprise Edition.
+  # To enable, upgrade to Enterprise and add:
+  #   NEO4J_server_metrics_prometheus_enabled: "true" to the neo4j service
+  #   and expose port 2004, then uncomment the job below.
+  # - job_name: 'neo4j'
+  #   metrics_path: /metrics
+  #   static_configs:
+  #     - targets: ['neo4j:2004']

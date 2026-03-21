@@ -1,128 +1,1182 @@
 {
-  "dashboard": {
-    "title": "Agent System Metrics",
-    "uid": "eedgeai-main",
-    "schemaVersion": 36,
-    "refresh": "10s",
-    "panels": [
-      {
-        "id": 1,
-        "type": "stat",
-        "title": "Proxy Up",
-        "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
-        "targets": [
-          {
-            "expr": "up{job=\"proxy\"}",
-            "legendFormat": "proxy"
-          }
-        ],
-        "options": {
-          "reduceOptions": { "calcs": ["lastNotNull"] },
-          "colorMode": "background",
-          "thresholds": {
-            "steps": [
-              { "color": "red", "value": 0 },
-              { "color": "green", "value": 1 }
-            ]
-          }
+  "title": "EedgeAI \u00e2\u20ac\u201d GCOR Full Observability",
+  "uid": "eedgeai-gcor",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Proxy",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "up{job=\"proxy\"}",
+          "legendFormat": "proxy"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
         },
-        "datasource": "Prometheus"
-      },
-      {
-        "id": 2,
-        "type": "stat",
-        "title": "Neo4j Up",
-        "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
-        "targets": [
-          {
-            "expr": "up{job=\"neo4j\"}",
-            "legendFormat": "neo4j"
-          }
-        ],
-        "options": {
-          "reduceOptions": { "calcs": ["lastNotNull"] },
-          "colorMode": "background",
-          "thresholds": {
-            "steps": [
-              { "color": "red", "value": 0 },
-              { "color": "green", "value": 1 }
-            ]
-          }
-        },
-        "datasource": "Prometheus"
-      },
-      {
-        "id": 3,
-        "type": "stat",
-        "title": "OpenClaw Up",
-        "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
-        "targets": [
-          {
-            "expr": "up{job=\"openclaw\"}",
-            "legendFormat": "openclaw"
-          }
-        ],
-        "options": {
-          "reduceOptions": { "calcs": ["lastNotNull"] },
-          "colorMode": "background",
-          "thresholds": {
-            "steps": [
-              { "color": "red", "value": 0 },
-              { "color": "green", "value": 1 }
-            ]
-          }
-        },
-        "datasource": "Prometheus"
-      },
-      {
-        "id": 4,
-        "type": "stat",
-        "title": "Qdrant Up",
-        "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
-        "targets": [
-          {
-            "expr": "up{job=\"qdrant\"}",
-            "legendFormat": "qdrant"
-          }
-        ],
-        "options": {
-          "reduceOptions": { "calcs": ["lastNotNull"] },
-          "colorMode": "background",
-          "thresholds": {
-            "steps": [
-              { "color": "red", "value": 0 },
-              { "color": "green", "value": 1 }
-            ]
-          }
-        },
-        "datasource": "Prometheus"
-      },
-      {
-        "id": 5,
-        "type": "timeseries",
-        "title": "HTTP Request Rate (proxy)",
-        "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
-        "targets": [
-          {
-            "expr": "rate(http_requests_total{job=\"proxy\"}[1m])",
-            "legendFormat": "{{method}} {{path}}"
-          }
-        ],
-        "datasource": "Prometheus"
-      },
-      {
-        "id": 6,
-        "type": "timeseries",
-        "title": "HTTP Error Rate (proxy)",
-        "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
-        "targets": [
-          {
-            "expr": "rate(http_requests_total{job=\"proxy\", status=~\"5..\"}[1m])",
-            "legendFormat": "5xx errors"
-          }
-        ],
-        "datasource": "Prometheus"
+        "colorMode": "background",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "red",
+              "value": 0
+            },
+            {
+              "color": "green",
+              "value": 1
+            }
+          ]
+        }
       }
-    ]
-  }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Neo4j",
+      "gridPos": {
+        "x": 4,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "up{job=\"neo4j\"}",
+          "legendFormat": "neo4j"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "red",
+              "value": 0
+            },
+            {
+              "color": "green",
+              "value": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Qdrant",
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "up{job=\"qdrant\"}",
+          "legendFormat": "qdrant"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "red",
+              "value": 0
+            },
+            {
+              "color": "green",
+              "value": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "OpenClaw",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "up{job=\"openclaw\"}",
+          "legendFormat": "openclaw"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "red",
+              "value": 0
+            },
+            {
+              "color": "green",
+              "value": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "RAG Requests (24h)",
+      "gridPos": {
+        "x": 16,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "increase(gcor_rag_requests_total[24h])",
+          "legendFormat": "requests"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "blue",
+              "value": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Ingests (24h)",
+      "gridPos": {
+        "x": 20,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "increase(gcor_ingest_total{status=\"success\"}[24h])",
+          "legendFormat": "ingests"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "blue",
+              "value": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "GCOR RAG Pipeline",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "RAG Request Rate (req/s)",
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by(intent) (rate(gcor_rag_requests_total[2m]))",
+          "legendFormat": "{{intent}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "RAG Pipeline Latency (p50 / p95 / p99)",
+      "gridPos": {
+        "x": 12,
+        "y": 5,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(gcor_rag_duration_seconds_bucket[5m]))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(gcor_rag_duration_seconds_bucket[5m]))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(gcor_rag_duration_seconds_bucket[5m]))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "piechart",
+      "title": "Intent Distribution",
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by(intent) (gcor_rag_requests_total)",
+          "legendFormat": "{{intent}}"
+        }
+      ],
+      "options": {
+        "pieType": "pie",
+        "displayLabels": [
+          "name",
+          "percent"
+        ]
+      }
+    },
+    {
+      "id": 14,
+      "type": "piechart",
+      "title": "Fallback Mode Distribution",
+      "gridPos": {
+        "x": 8,
+        "y": 13,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by(fallback_mode) (gcor_rag_requests_total)",
+          "legendFormat": "{{fallback_mode}}"
+        }
+      ],
+      "options": {
+        "pieType": "donut",
+        "displayLabels": [
+          "name",
+          "percent"
+        ]
+      }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Qdrant Hits & Neo4j Records (avg per request)",
+      "gridPos": {
+        "x": 16,
+        "y": 13,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "rate(gcor_qdrant_hits_sum[5m]) / rate(gcor_qdrant_hits_count[5m])",
+          "legendFormat": "Qdrant hits avg"
+        },
+        {
+          "expr": "rate(gcor_neo4j_records_sum[5m]) / rate(gcor_neo4j_records_count[5m])",
+          "legendFormat": "Neo4j records avg"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 20,
+      "type": "row",
+      "title": "LLM & Embeddings",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 21,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "LLM Request Rate by Backend (req/s)",
+      "gridPos": {
+        "x": 0,
+        "y": 22,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by(backend) (rate(gcor_llm_requests_total{status=\"success\"}[2m]))",
+          "legendFormat": "{{backend}} success"
+        },
+        {
+          "expr": "sum by(backend) (rate(gcor_llm_requests_total{status=\"error\"}[2m]))",
+          "legendFormat": "{{backend}} error"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        }
+      }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "LLM Latency p50 / p95 (non-streaming)",
+      "gridPos": {
+        "x": 8,
+        "y": 22,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by(backend, le) (rate(gcor_llm_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{backend}} p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by(backend, le) (rate(gcor_llm_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{backend}} p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Embedding API Latency p50 / p95",
+      "gridPos": {
+        "x": 16,
+        "y": 22,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(gcor_embed_duration_seconds_bucket[5m]))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(gcor_embed_duration_seconds_bucket[5m]))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "id": 24,
+      "type": "stat",
+      "title": "LLM Errors (1h)",
+      "gridPos": {
+        "x": 0,
+        "y": 30,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "increase(gcor_llm_requests_total{status=\"error\"}[1h])",
+          "legendFormat": "errors"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "green",
+              "value": 0
+            },
+            {
+              "color": "yellow",
+              "value": 1
+            },
+            {
+              "color": "red",
+              "value": 5
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 25,
+      "type": "stat",
+      "title": "LLM Total Calls (1h)",
+      "gridPos": {
+        "x": 6,
+        "y": 30,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "increase(gcor_llm_requests_total{status=\"success\"}[1h])",
+          "legendFormat": "calls"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "blue",
+              "value": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 26,
+      "type": "stat",
+      "title": "Embed Calls (1h)",
+      "gridPos": {
+        "x": 12,
+        "y": 30,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "increase(gcor_embed_duration_seconds_count[1h])",
+          "legendFormat": "embeds"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "blue",
+              "value": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 27,
+      "type": "stat",
+      "title": "LLM Exceptions (1h)",
+      "gridPos": {
+        "x": 18,
+        "y": 30,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "increase(gcor_llm_requests_total{status=\"exception\"}[1h])",
+          "legendFormat": "exceptions"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "green",
+              "value": 0
+            },
+            {
+              "color": "red",
+              "value": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 30,
+      "type": "row",
+      "title": "Ingest Operations",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Ingest Rate (docs/min)",
+      "gridPos": {
+        "x": 0,
+        "y": 35,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "rate(gcor_ingest_total{status=\"success\"}[5m]) * 60",
+          "legendFormat": "success"
+        },
+        {
+          "expr": "rate(gcor_ingest_total{status=~\".*error\"}[5m]) * 60",
+          "legendFormat": "errors"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Chunks per Document (avg)",
+      "gridPos": {
+        "x": 12,
+        "y": 35,
+        "w": 6,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "rate(gcor_ingest_chunks_sum[5m]) / rate(gcor_ingest_chunks_count[5m])",
+          "legendFormat": "avg chunks/doc"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 33,
+      "type": "stat",
+      "title": "Total Docs Ingested",
+      "gridPos": {
+        "x": 18,
+        "y": 35,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "gcor_ingest_total{status=\"success\"}",
+          "legendFormat": "total docs"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "blue",
+              "value": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 34,
+      "type": "stat",
+      "title": "Collection Ops (1h)",
+      "gridPos": {
+        "x": 18,
+        "y": 39,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "increase(gcor_collection_ops_total[1h])",
+          "legendFormat": "{{operation}}"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "blue",
+              "value": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 40,
+      "type": "row",
+      "title": "HTTP API (Proxy)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 43,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 41,
+      "type": "timeseries",
+      "title": "HTTP Request Rate by Handler (req/s)",
+      "gridPos": {
+        "x": 0,
+        "y": 44,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by(handler) (rate(http_requests_total{job=\"proxy\"}[2m]))",
+          "legendFormat": "{{handler}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        }
+      }
+    },
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "HTTP Error Rate (4xx / 5xx)",
+      "gridPos": {
+        "x": 12,
+        "y": 44,
+        "w": 6,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{job=\"proxy\", status_code=~\"4..\"}[2m]))",
+          "legendFormat": "4xx"
+        },
+        {
+          "expr": "sum(rate(http_requests_total{job=\"proxy\", status_code=~\"5..\"}[2m]))",
+          "legendFormat": "5xx"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        }
+      }
+    },
+    {
+      "id": 43,
+      "type": "timeseries",
+      "title": "HTTP Request Latency p50 / p95 / p99",
+      "gridPos": {
+        "x": 18,
+        "y": 44,
+        "w": 6,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by(le) (rate(http_request_duration_seconds_bucket{job=\"proxy\"}[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(http_request_duration_seconds_bucket{job=\"proxy\"}[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by(le) (rate(http_request_duration_seconds_bucket{job=\"proxy\"}[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "id": 60,
+      "type": "row",
+      "title": "Qdrant Vector Database",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 69,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 61,
+      "type": "timeseries",
+      "title": "Qdrant REST Request Rate",
+      "gridPos": {
+        "x": 0,
+        "y": 70,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by(endpoint) (rate(rest_responses_total[2m]))",
+          "legendFormat": "{{endpoint}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        }
+      }
+    },
+    {
+      "id": 62,
+      "type": "timeseries",
+      "title": "Qdrant REST Latency p95",
+      "gridPos": {
+        "x": 12,
+        "y": 70,
+        "w": 6,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(rest_response_duration_seconds_bucket[5m]))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "id": 63,
+      "type": "stat",
+      "title": "Qdrant Collections",
+      "gridPos": {
+        "x": 18,
+        "y": 70,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "collections_total",
+          "legendFormat": "collections"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "blue",
+              "value": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 64,
+      "type": "timeseries",
+      "title": "Qdrant gRPC Request Rate",
+      "gridPos": {
+        "x": 0,
+        "y": 78,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by(endpoint) (rate(grpc_responses_total[2m]))",
+          "legendFormat": "{{endpoint}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        }
+      }
+    },
+    {
+      "id": 65,
+      "type": "stat",
+      "title": "Qdrant Vectors Count",
+      "gridPos": {
+        "x": 12,
+        "y": 78,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(vectors_total)",
+          "legendFormat": "vectors"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "blue",
+              "value": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 70,
+      "type": "row",
+      "title": "Prometheus Scrape Health",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 86,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 71,
+      "type": "timeseries",
+      "title": "Scrape Target Availability",
+      "gridPos": {
+        "x": 0,
+        "y": 87,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "up",
+          "legendFormat": "{{job}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "unit": "short",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "red",
+                "value": 0
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      }
+    },
+    {
+      "id": 72,
+      "type": "timeseries",
+      "title": "Prometheus Scrape Duration",
+      "gridPos": {
+        "x": 12,
+        "y": 87,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "scrape_duration_seconds",
+          "legendFormat": "{{job}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "id": 50,
+      "type": "text",
+      "title": "Neo4j Metrics",
+      "gridPos": {
+        "x": 0,
+        "y": 52,
+        "w": 24,
+        "h": 4
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "> **Neo4j Prometheus metrics** require **Neo4j Enterprise Edition**. Community edition does not expose a Prometheus endpoint.\n>\n> To enable: upgrade to Enterprise, add  to the neo4j service in docker-compose, expose port 2004, and uncomment the  job in ."
+      }
+    }
+  ]
 }
