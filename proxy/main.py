@@ -67,6 +67,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Stre
 from neo4j import AsyncGraphDatabase
 from prometheus_client import Counter, Histogram
 from prometheus_fastapi_instrumentator import Instrumentator
+from document_intel import process_document, DocIntelResult
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -144,10 +145,19 @@ OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
 OPENAI_CHAT_MODEL    = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")
 ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_CHAT_MODEL = os.getenv("ANTHROPIC_CHAT_MODEL", "claude-sonnet-4-6")
-LLM_BACKEND          = os.getenv("LLM_BACKEND", "openai")
+LLM_BACKEND          = os.getenv("LLM_BACKEND", "openai")   # openai | anthropic | ollama
+
+# ── Ollama ─────────────────────────────────────────────────────────────────────
+OLLAMA_BASE_URL        = os.getenv("OLLAMA_BASE_URL",        "http://ollama:11434")
+OLLAMA_MODEL           = os.getenv("OLLAMA_MODEL",           "llama3.2")
+OLLAMA_EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
 
 # ── Embedding ──────────────────────────────────────────────────────────────────
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "openai")   # openai | ollama
+EMBEDDING_MODEL   = os.getenv("EMBEDDING_MODEL",   "text-embedding-3-small")
+EMBED_BATCH_SIZE  = int(os.getenv("EMBED_BATCH_SIZE",  "32"))   # chunks per OpenAI call
+EMBED_BATCH_DELAY = float(os.getenv("EMBED_BATCH_DELAY", "0.5")) # seconds between batches
+EMBED_MAX_RETRIES = int(os.getenv("EMBED_MAX_RETRIES",  "6"))    # 429/5xx retry attempts
 
 # ── Qdrant (semantic perception layer) ────────────────────────────────────────
 QDRANT_URL        = os.getenv("QDRANT_URL",        "http://qdrant:6333")
@@ -203,21 +213,93 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-async def embed_text(text: str) -> list | None:
-    if not OPENAI_API_KEY:
-        return None
-    try:
-        t0 = time.monotonic()
-        async with httpx.AsyncClient(timeout=30) as c:
+import asyncio
+import random
+
+async def _embed_with_retry(
+    payload: dict,
+    *,
+    max_retries: int = EMBED_MAX_RETRIES,
+) -> dict:
+    """
+    POST to OpenAI /v1/embeddings with exponential-backoff retry on 429 / 5xx.
+
+    Respects the Retry-After header when present.
+    Raises httpx.HTTPStatusError on permanent failure.
+    """
+    base_delay = 1.0
+    for attempt in range(max_retries + 1):
+        async with httpx.AsyncClient(timeout=60) as c:
             resp = await c.post(
                 "https://api.openai.com/v1/embeddings",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                json={"input": text[:8000], "model": EMBEDDING_MODEL},
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
+                         "Content-Type": "application/json"},
+                json=payload,
+            )
+
+        if resp.status_code == 200:
+            return resp.json()
+
+        retry_after = None
+        if resp.status_code == 429 or resp.status_code >= 500:
+            # Honour Retry-After header if present
+            ra = resp.headers.get("retry-after") or resp.headers.get("x-ratelimit-reset-requests")
+            if ra:
+                try:
+                    retry_after = float(ra)
+                except ValueError:
+                    pass
+
+            if attempt < max_retries:
+                wait = retry_after if retry_after else (base_delay * (2 ** attempt) + random.uniform(0, 0.5))
+                logger.warning(
+                    "OpenAI embeddings %s (attempt %d/%d) — waiting %.1fs",
+                    resp.status_code, attempt + 1, max_retries, wait,
+                )
+                await asyncio.sleep(wait)
+                continue
+
+        resp.raise_for_status()   # permanent error
+
+    resp.raise_for_status()
+
+
+async def _embed_batch(texts: list[str]) -> list[list[float]]:
+    """Embed a batch of texts via the configured backend (OpenAI or Ollama)."""
+    if EMBEDDING_BACKEND == "ollama":
+        async with httpx.AsyncClient(timeout=120) as c:
+            resp = await c.post(
+                f"{OLLAMA_BASE_URL}/v1/embeddings",
+                json={"input": texts, "model": OLLAMA_EMBEDDING_MODEL},
             )
             resp.raise_for_status()
-            embedding = resp.json()["data"][0]["embedding"]
+        items = resp.json()["data"]
+        items.sort(key=lambda x: x["index"])
+        return [d["embedding"] for d in items]
+    data = await _embed_with_retry({"input": texts, "model": EMBEDDING_MODEL})
+    items = data["data"]
+    items.sort(key=lambda x: x["index"])
+    return [d["embedding"] for d in items]
+
+
+async def embed_text(text: str) -> list | None:
+    try:
+        t0 = time.monotonic()
+        if EMBEDDING_BACKEND == "ollama":
+            async with httpx.AsyncClient(timeout=60) as c:
+                resp = await c.post(
+                    f"{OLLAMA_BASE_URL}/v1/embeddings",
+                    json={"input": text[:8000], "model": OLLAMA_EMBEDDING_MODEL},
+                )
+                resp.raise_for_status()
+            vec = resp.json()["data"][0]["embedding"]
+        else:
+            if not OPENAI_API_KEY:
+                return None
+            data = await _embed_with_retry({"input": text[:8000], "model": EMBEDDING_MODEL})
+            vec = data["data"][0]["embedding"]
         METRIC_EMBED_DURATION.observe(time.monotonic() - t0)
-        return embedding
+        return vec
     except Exception as exc:
         logger.warning("Embedding failed: %s", exc)
         return None
@@ -682,7 +764,47 @@ def _resolve_model(model: str) -> tuple:
         return model, "openai"
     if LLM_BACKEND == "anthropic":
         return ANTHROPIC_CHAT_MODEL, "anthropic"
+    if LLM_BACKEND == "ollama":
+        return OLLAMA_MODEL, "ollama"
     return OPENAI_CHAT_MODEL, "openai"
+
+
+async def call_ollama(body: dict):
+    """Forward chat completions to the local Ollama OpenAI-compatible endpoint."""
+    url = f"{OLLAMA_BASE_URL}/v1/chat/completions"
+    body = {**body, "model": body.get("model", OLLAMA_MODEL)}
+    if body.get("stream"):
+        async def stream():
+            try:
+                METRIC_LLM_REQUESTS.labels(backend="ollama", status="started").inc()
+                async with httpx.AsyncClient(timeout=300) as c:
+                    async with c.stream("POST", url, json=body) as resp:
+                        if resp.status_code != 200:
+                            err = await resp.aread()
+                            logger.error("Ollama %s: %s", resp.status_code, err[:200])
+                            METRIC_LLM_REQUESTS.labels(backend="ollama", status="error").inc()
+                            yield f'data: {{"error": "Ollama {resp.status_code}"}}\n\n'.encode()
+                            return
+                        METRIC_LLM_REQUESTS.labels(backend="ollama", status="success").inc()
+                        async for chunk in resp.aiter_bytes():
+                            yield chunk
+            except Exception as exc:
+                logger.error("Ollama stream error: %s", exc)
+                METRIC_LLM_REQUESTS.labels(backend="ollama", status="exception").inc()
+                yield b'data: {"error": "proxy error"}\n\n'
+        return StreamingResponse(stream(), media_type="text/event-stream")
+    else:
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=300) as c:
+                resp = await c.post(url, json=body)
+                resp.raise_for_status()
+            METRIC_LLM_REQUESTS.labels(backend="ollama", status="success").inc()
+            METRIC_LLM_DURATION.labels(backend="ollama").observe(time.monotonic() - t0)
+            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+        except Exception:
+            METRIC_LLM_REQUESTS.labels(backend="ollama", status="error").inc()
+            raise
 
 
 async def call_openai(body: dict):
@@ -801,32 +923,48 @@ async def call_anthropic(body: dict):
 @app.get("/v1/models")
 async def list_models():
     models = []
+    # Pull Ollama models
+    if LLM_BACKEND == "ollama" or EMBEDDING_BACKEND == "ollama":
+        try:
+            async with httpx.AsyncClient(timeout=5) as c:
+                resp = await c.get(f"{OLLAMA_BASE_URL}/api/tags")
+                if resp.status_code == 200:
+                    for m in resp.json().get("models", []):
+                        models.append({"id": m["name"], "object": "model", "owned_by": "ollama"})
+        except Exception as exc:
+            logger.warning("Could not fetch Ollama models: %s", exc)
+    # Pull OpenAI models
     if OPENAI_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=10) as c:
                 resp = await c.get("https://api.openai.com/v1/models",
                                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"})
                 if resp.status_code == 200:
-                    models = resp.json().get("data", [])
+                    models += resp.json().get("data", [])
         except Exception as exc:
             logger.warning("Could not fetch OpenAI models: %s", exc)
     if not models:
         models = [
             {"id": OPENAI_CHAT_MODEL,    "object": "model", "owned_by": "openai"},
             {"id": ANTHROPIC_CHAT_MODEL, "object": "model", "owned_by": "anthropic"},
+            {"id": OLLAMA_MODEL,         "object": "model", "owned_by": "ollama"},
         ]
-    # Always surface the cognitive RAG model at the top of the list
     models = [{"id": "openclaw", "object": "model", "created": 1700000000, "owned_by": "eedgeai"}] + models
     return {"object": "list", "data": models}
 
 
 @app.post("/v1/embeddings")
 async def embeddings(request: Request):
-    """Proxy embedding requests to OpenAI (for OpenWebUI's built-in RAG)."""
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
+    """Proxy embedding requests to the configured backend (for OpenWebUI's built-in RAG)."""
     body = await request.json()
     try:
+        if EMBEDDING_BACKEND == "ollama":
+            async with httpx.AsyncClient(timeout=60) as c:
+                resp = await c.post(f"{OLLAMA_BASE_URL}/v1/embeddings", json=body)
+                resp.raise_for_status()
+                return JSONResponse(content=resp.json())
+        if not OPENAI_API_KEY:
+            raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
         async with httpx.AsyncClient(timeout=30) as c:
             resp = await c.post(
                 "https://api.openai.com/v1/embeddings",
@@ -903,12 +1041,14 @@ async def chat_completions(request: Request):
     model, backend = _resolve_model(body.get("model", "openclaw"))
     body = {**body, "model": model}
     try:
-        if backend == "anthropic" and ANTHROPIC_API_KEY:
+        if backend == "ollama":
+            return await call_ollama(body)
+        elif backend == "anthropic" and ANTHROPIC_API_KEY:
             return await call_anthropic(body)
         elif OPENAI_API_KEY:
             return await call_openai(body)
         else:
-            raise HTTPException(status_code=503, detail="No LLM API key configured")
+            raise HTTPException(status_code=503, detail="No LLM backend configured")
     except httpx.HTTPStatusError as exc:
         logger.error("LLM upstream error: %s", exc)
         raise HTTPException(status_code=exc.response.status_code, detail="LLM upstream error")
@@ -1024,6 +1164,242 @@ async def api_collection_docs(name: str):
         raise HTTPException(status_code=502, detail=str(exc))
     finally:
         await driver.close()
+
+
+_DOC_ARCHIVE_COLLECTION = "_doc_archive"
+
+
+@app.delete("/api/collections/{name}/docs/{doc_id}")
+async def api_archive_document(name: str, doc_id: str):
+    """Archive a single document: move its Qdrant points to _doc_archive, mark Neo4j nodes."""
+    now = _now_iso()
+    points: list = []
+
+    async with httpx.AsyncClient(timeout=60) as c:
+        chk = await c.get(f"{QDRANT_URL}/collections/{name}")
+        if chk.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+        vec_params = (chk.json().get("result", {})
+                      .get("config", {}).get("params", {}).get("vectors", {}))
+        vec_size = vec_params.get("size", 1536) if isinstance(vec_params, dict) else 1536
+        distance = vec_params.get("distance", "Cosine") if isinstance(vec_params, dict) else "Cosine"
+
+        # Ensure archive collection exists
+        arc_chk = await c.get(f"{QDRANT_URL}/collections/{_DOC_ARCHIVE_COLLECTION}")
+        if arc_chk.status_code == 404:
+            cr = await c.put(
+                f"{QDRANT_URL}/collections/{_DOC_ARCHIVE_COLLECTION}",
+                json={"vectors": {"size": vec_size, "distance": distance}},
+            )
+            cr.raise_for_status()
+
+        # Scroll all points for this document
+        offset = None
+        while True:
+            scroll_body: dict = {
+                "limit": 100, "with_payload": True, "with_vector": True,
+                "filter": {"must": [{"key": "document_id", "match": {"value": doc_id}}]},
+            }
+            if offset is not None:
+                scroll_body["offset"] = offset
+            sr = await c.post(f"{QDRANT_URL}/collections/{name}/points/scroll", json=scroll_body)
+            sr.raise_for_status()
+            result = sr.json().get("result", {})
+            pts = result.get("points", [])
+            points.extend(pts)
+            offset = result.get("next_page_offset")
+            if offset is None:
+                break
+
+        if not points:
+            raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found in '{name}'")
+
+        # Stamp archive metadata into each point's payload
+        for p in points:
+            if p.get("payload") is None:
+                p["payload"] = {}
+            p["payload"]["_archived_from_collection"] = name
+            p["payload"]["_archived_at"] = now
+
+        # Copy to _doc_archive
+        ur = await c.put(
+            f"{QDRANT_URL}/collections/{_DOC_ARCHIVE_COLLECTION}/points",
+            params={"wait": "true"}, json={"points": points},
+        )
+        ur.raise_for_status()
+
+        # Remove from source collection
+        dr = await c.post(
+            f"{QDRANT_URL}/collections/{name}/points/delete",
+            params={"wait": "true"},
+            json={"filter": {"must": [{"key": "document_id", "match": {"value": doc_id}}]}},
+        )
+        dr.raise_for_status()
+
+    # Neo4j: mark Document as archived and record ArchivedDocument node
+    title = doc_id
+    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    try:
+        async with driver.session(database=NEO4J_DATABASE) as s:
+            res = await s.run(
+                "MATCH (d:Document {document_id: $did}) "
+                "SET d.archived = true, d.archived_at = $now, d.archived_from = $col "
+                "RETURN d.title AS title",
+                did=doc_id, now=now, col=name,
+            )
+            rec = await res.single()
+            if rec and rec["title"]:
+                title = rec["title"]
+            await s.run(
+                "MERGE (a:ArchivedDocument {document_id: $did}) "
+                "SET a.title = $title, a.source_collection = $col, "
+                "    a.archived_at = $now, a.chunk_count = $cc",
+                did=doc_id, title=title, col=name, now=now, cc=len(points),
+            )
+    except Exception as exc:
+        logger.warning("Neo4j archive doc metadata failed: %s", exc)
+    finally:
+        await driver.close()
+
+    return {
+        "status":            "archived",
+        "doc_id":            doc_id,
+        "title":             title,
+        "source_collection": name,
+        "chunks_archived":   len(points),
+    }
+
+
+@app.get("/api/doc-archives")
+async def api_list_doc_archives():
+    """List all individually archived documents."""
+    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    try:
+        async with driver.session(database=NEO4J_DATABASE) as s:
+            result = await s.run(
+                "MATCH (a:ArchivedDocument) "
+                "RETURN a.document_id AS doc_id, a.title AS title, "
+                "       a.source_collection AS source_collection, "
+                "       a.archived_at AS archived_at, a.chunk_count AS chunk_count "
+                "ORDER BY a.archived_at DESC"
+            )
+            records = await result.data()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    finally:
+        await driver.close()
+    return {"doc_archives": [dict(r) for r in records]}
+
+
+@app.post("/api/doc-archives/{doc_id}/restore")
+async def api_restore_doc_archive(doc_id: str, request: Request):
+    """Restore an archived document back into its original (or specified) collection."""
+    body = await request.json()
+    target_collection = (body.get("collection") or "").strip()
+
+    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    try:
+        async with driver.session(database=NEO4J_DATABASE) as s:
+            res = await s.run(
+                "MATCH (a:ArchivedDocument {document_id: $did}) "
+                "RETURN a.source_collection AS source_collection",
+                did=doc_id,
+            )
+            rec = await res.single()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    finally:
+        await driver.close()
+
+    if not rec:
+        raise HTTPException(status_code=404, detail=f"Archived document '{doc_id}' not found")
+
+    restore_to = target_collection or rec["source_collection"]
+    points: list = []
+
+    async with httpx.AsyncClient(timeout=60) as c:
+        arc_chk = await c.get(f"{QDRANT_URL}/collections/{_DOC_ARCHIVE_COLLECTION}")
+        if arc_chk.status_code == 404:
+            raise HTTPException(status_code=404, detail="Document archive not found in Qdrant")
+
+        # Ensure target collection exists
+        tgt_chk = await c.get(f"{QDRANT_URL}/collections/{restore_to}")
+        if tgt_chk.status_code == 404:
+            vec_params = (arc_chk.json().get("result", {})
+                          .get("config", {}).get("params", {}).get("vectors", {}))
+            vec_size = vec_params.get("size", 1536) if isinstance(vec_params, dict) else 1536
+            distance = vec_params.get("distance", "Cosine") if isinstance(vec_params, dict) else "Cosine"
+            cr = await c.put(
+                f"{QDRANT_URL}/collections/{restore_to}",
+                json={"vectors": {"size": vec_size, "distance": distance}},
+            )
+            cr.raise_for_status()
+
+        # Scroll archived points for this document
+        offset = None
+        while True:
+            scroll_body: dict = {
+                "limit": 100, "with_payload": True, "with_vector": True,
+                "filter": {"must": [{"key": "document_id", "match": {"value": doc_id}}]},
+            }
+            if offset is not None:
+                scroll_body["offset"] = offset
+            sr = await c.post(
+                f"{QDRANT_URL}/collections/{_DOC_ARCHIVE_COLLECTION}/points/scroll",
+                json=scroll_body,
+            )
+            sr.raise_for_status()
+            result = sr.json().get("result", {})
+            pts = result.get("points", [])
+            points.extend(pts)
+            offset = result.get("next_page_offset")
+            if offset is None:
+                break
+
+        if not points:
+            raise HTTPException(status_code=404, detail=f"No archived vectors found for '{doc_id}'")
+
+        # Strip archive metadata before restoring
+        for p in points:
+            if p.get("payload"):
+                p["payload"].pop("_archived_from_collection", None)
+                p["payload"].pop("_archived_at", None)
+
+        # Copy to target collection
+        ur = await c.put(
+            f"{QDRANT_URL}/collections/{restore_to}/points",
+            params={"wait": "true"}, json={"points": points},
+        )
+        ur.raise_for_status()
+
+        # Delete from archive
+        dr = await c.post(
+            f"{QDRANT_URL}/collections/{_DOC_ARCHIVE_COLLECTION}/points/delete",
+            params={"wait": "true"},
+            json={"filter": {"must": [{"key": "document_id", "match": {"value": doc_id}}]}},
+        )
+        dr.raise_for_status()
+
+    # Neo4j cleanup
+    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    try:
+        async with driver.session(database=NEO4J_DATABASE) as s:
+            await s.run(
+                "MATCH (d:Document {document_id: $did}) "
+                "REMOVE d.archived REMOVE d.archived_at REMOVE d.archived_from",
+                did=doc_id,
+            )
+            await s.run(
+                "MATCH (a:ArchivedDocument {document_id: $did}) DETACH DELETE a",
+                did=doc_id,
+            )
+    except Exception as exc:
+        logger.warning("Neo4j restore doc cleanup failed: %s", exc)
+    finally:
+        await driver.close()
+
+    return {"status": "restored", "doc_id": doc_id, "collection": restore_to, "points_restored": len(points)}
 
 
 @app.post("/api/collections")
@@ -1365,42 +1741,193 @@ async def api_ingest(
     title: str = Form(""),
     agent_id: str = Form(""),
     access_level: str = Form("public"),
+    enable_docint: str = Form("false"),   # "true" → run full Document Intelligence
 ):
     """JSON-returning ingest endpoint used by the knowledge UI."""
-    filename = file.filename or "upload"
-    ext = os.path.splitext(filename)[1].lower()
-    if ext not in _INGEST_ACCEPT:
-        raise HTTPException(status_code=415, detail=f"Unsupported type '{ext}'")
-    data = await file.read()
+    filename    = file.filename or "upload"
+    data        = await file.read()
+    use_docint  = enable_docint.lower() in ("true", "1", "yes")
+
     if not data:
         raise HTTPException(status_code=400, detail="Empty file")
-    doc_title = title.strip() or filename
-    doc_id    = hashlib.md5(f"{filename}-{datetime.now().isoformat()}".encode()).hexdigest()[:16]
+
+    ext = _resolve_ext(filename, data)
+    if ext not in _INGEST_ACCEPT:
+        raise HTTPException(status_code=415, detail=f"Unsupported type '{ext}'")
+
+    doc_title  = title.strip() or filename
+    doc_id     = hashlib.md5(f"{filename}-{datetime.now().isoformat()}".encode()).hexdigest()[:16]
+    image_props: dict = {}
+    docint_summary: dict = {}
+
     try:
-        text = _extract_text(filename, data).strip()
+        if use_docint:
+            # Full Document Intelligence pipeline
+            result: DocIntelResult = await process_document(filename, data)
+            text        = result.to_rich_text().strip()
+            image_props = result.image_props
+            docint_summary = {
+                "document_type":    result.document_type,
+                "document_subtype": result.document_subtype,
+                "is_scanned":       result.is_scanned,
+                "pages":            result.pages,
+                "language":         result.language,
+                "tables":           len(result.tables),
+                "form_fields":      len(result.form_fields),
+                "entities": {
+                    "dates":         result.entities.dates[:5],
+                    "amounts":       result.entities.amounts[:5],
+                    "names":         result.entities.names[:5],
+                    "organizations": result.entities.organizations[:5],
+                },
+            }
+            # Store tables as separate Neo4j nodes (linked after main ingest)
+            _docint_tables_pending[doc_id] = result.tables
+        elif _is_image(ext):
+            text, image_props = await _extract_image_text(filename, data, ext)
+            text = text.strip()
+        else:
+            text = _extract_text(filename, data).strip()
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Extraction failed: {exc}")
+
     if not text:
         raise HTTPException(status_code=422, detail="No text extracted")
     chunks = _chunk_text(text)
     if not chunks:
         raise HTTPException(status_code=422, detail="No chunks produced")
-    logger.info("API ingest '%s': %d chunks", doc_title, len(chunks))
+    logger.info("API ingest '%s': %d chunks (ext=%s, docint=%s)", doc_title, len(chunks), ext, use_docint)
+
     try:
-        _, chunk_eids = await _neo4j_ingest(doc_id, doc_title, filename, chunks, agent_id, access_level)
+        _, chunk_eids = await _neo4j_ingest(
+            doc_id, doc_title, filename, chunks, agent_id, access_level, image_props
+        )
     except Exception as exc:
         METRIC_INGEST_TOTAL.labels(status="neo4j_error").inc()
         raise HTTPException(status_code=502, detail=f"Neo4j: {exc}")
+
+    # Persist DocTable nodes for DocInt results
+    if doc_id in _docint_tables_pending:
+        try:
+            await _neo4j_ingest_tables(doc_id, _docint_tables_pending.pop(doc_id))
+        except Exception as e:
+            logger.warning("DocInt table Neo4j write failed: %s", e)
+
     try:
         upserted = await _qdrant_ingest(QDRANT_COLLECTION, chunks, chunk_eids, doc_id, doc_title, agent_id, access_level)
     except Exception as exc:
         METRIC_INGEST_TOTAL.labels(status="qdrant_error").inc()
         raise HTTPException(status_code=502, detail=f"Qdrant: {exc}")
+
     METRIC_INGEST_TOTAL.labels(status="success").inc()
     METRIC_INGEST_CHUNKS.observe(len(chunks))
-    return {"status": "ok", "document_id": doc_id, "title": doc_title,
-            "filename": filename, "chunks": len(chunks), "qdrant_points": upserted,
-            "collection": QDRANT_COLLECTION}
+
+    result_json = {"status": "ok", "document_id": doc_id, "title": doc_title,
+                   "filename": filename, "chunks": len(chunks), "qdrant_points": upserted,
+                   "collection": QDRANT_COLLECTION}
+    if image_props:
+        result_json["image_metadata"] = image_props
+    if docint_summary:
+        result_json["docint"] = docint_summary
+    return result_json
+
+
+# In-memory staging for DocTable nodes created during /api/ingest
+_docint_tables_pending: dict[str, list] = {}
+
+
+async def _neo4j_ingest_tables(doc_id: str, tables: list) -> None:
+    """Create DocTable nodes in Neo4j linked to the parent Document."""
+    if not tables:
+        return
+    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    now = _now_iso()
+    try:
+        async with driver.session(database=NEO4J_DATABASE) as s:
+            for i, t in enumerate(tables):
+                await s.run(
+                    """MATCH (d:Document {document_id: $doc_id})
+                       CREATE (t:DocTable {
+                         table_id:   $tid,
+                         caption:    $caption,
+                         markdown:   $markdown,
+                         row_count:  $rows,
+                         col_count:  $cols,
+                         page:       $page,
+                         created_at: $now
+                       })
+                       CREATE (d)-[:HAS_TABLE]->(t)""",
+                    doc_id=doc_id, tid=f"{doc_id}-table-{i}",
+                    caption=t.caption, markdown=t.markdown,
+                    rows=t.row_count, cols=t.col_count,
+                    page=t.page, now=now,
+                )
+    finally:
+        await driver.close()
+
+
+@app.post("/api/docint")
+async def api_docint(
+    file: UploadFile = File(...),
+    extract_tables:   str = Form("true"),
+    extract_forms:    str = Form("true"),
+    extract_entities: str = Form("true"),
+    classify:         str = Form("true"),
+    vision:           str = Form("true"),
+):
+    """
+    Standalone Document Intelligence endpoint.
+    Returns rich structured output without ingesting into Qdrant/Neo4j.
+    """
+    filename = file.filename or "upload"
+    data     = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    ext = _resolve_ext(filename, data)
+    if ext not in _INGEST_ACCEPT:
+        raise HTTPException(status_code=415, detail=f"Unsupported type '{ext}'")
+
+    def _bool(v: str) -> bool:
+        return v.lower() in ("true", "1", "yes")
+
+    try:
+        result: DocIntelResult = await process_document(
+            filename, data,
+            extract_tables=_bool(extract_tables),
+            extract_forms=_bool(extract_forms),
+            extract_entities=_bool(extract_entities),
+            classify=_bool(classify),
+            vision=_bool(vision),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return {
+        "filename":         filename,
+        "document_type":    result.document_type,
+        "document_subtype": result.document_subtype,
+        "type_confidence":  result.type_confidence,
+        "language":         result.language,
+        "is_scanned":       result.is_scanned,
+        "pages":            result.pages,
+        "char_count":       result.char_count,
+        "tables": [
+            {"caption": t.caption, "markdown": t.markdown,
+             "rows": t.row_count, "cols": t.col_count, "page": t.page}
+            for t in result.tables
+        ],
+        "form_fields": result.form_fields,
+        "entities": {
+            "dates":         result.entities.dates,
+            "amounts":       result.entities.amounts,
+            "names":         result.entities.names,
+            "organizations": result.entities.organizations,
+            "identifiers":   result.entities.identifiers,
+            "locations":     result.entities.locations,
+        },
+        "text_preview": result.text[:500],
+    }
 
 
 @app.get("/health")
@@ -1415,7 +1942,363 @@ async def health():
 
 # ── Document Ingest ────────────────────────────────────────────────────────────
 
-_INGEST_ACCEPT = {".txt", ".md", ".pdf", ".docx", ".json", ".csv"}
+_INGEST_ACCEPT = {
+    # Documents
+    ".txt", ".md", ".pdf", ".docx", ".json", ".csv",
+    # Regular images
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif", ".avif",
+    # Medical imaging
+    ".dcm", ".dicom", ".nii", ".nii.gz",
+}
+
+_IMAGE_EXTS   = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif", ".avif"}
+_MEDICAL_EXTS = {".dcm", ".dicom", ".nii", ".nii.gz"}
+
+
+def _resolve_ext(filename: str, data: bytes) -> str:
+    """Return the canonical extension, handling .nii.gz and DICOM magic."""
+    name = filename.lower()
+    if name.endswith(".nii.gz"):
+        return ".nii.gz"
+    ext = os.path.splitext(name)[1]
+    # DICOM files often arrive without extension — detect by preamble magic
+    if ext not in _INGEST_ACCEPT and len(data) >= 132 and data[128:132] == b"DICM":
+        return ".dcm"
+    return ext
+
+
+def _is_image(ext: str) -> bool:
+    return ext in _IMAGE_EXTS or ext in _MEDICAL_EXTS
+
+
+# ── Vision model helpers ───────────────────────────────────────────────────────
+
+_VISION_MAX_PX     = int(os.getenv("VISION_MAX_PX", "1024"))
+_VISION_MAX_TOKENS = int(os.getenv("VISION_MAX_TOKENS", "1200"))
+_NO_VISION         = os.getenv("NO_VISION", "0") == "1"
+
+
+async def _call_vision_api(png_b64: str, prompt: str) -> str:
+    """Send a PNG (base64) to the configured vision model and return the description."""
+    if _NO_VISION:
+        return "[Vision analysis skipped — NO_VISION=1]"
+
+    if LLM_BACKEND == "anthropic" and ANTHROPIC_API_KEY:
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key":         ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type":      "application/json",
+                },
+                json={
+                    "model":      os.getenv("VISION_MODEL", "claude-3-5-sonnet-20241022"),
+                    "max_tokens": _VISION_MAX_TOKENS,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "image",
+                             "source": {"type": "base64", "media_type": "image/png",
+                                        "data": png_b64}},
+                            {"type": "text", "text": prompt},
+                        ],
+                    }],
+                },
+            )
+            r.raise_for_status()
+            return r.json()["content"][0]["text"].strip()
+
+    # OpenAI fallback
+    if not OPENAI_API_KEY:
+        return "[Vision unavailable — no API key configured]"
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await c.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
+                     "Content-Type": "application/json"},
+            json={
+                "model":      os.getenv("VISION_MODEL", "gpt-4o"),
+                "max_tokens": _VISION_MAX_TOKENS,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/png;base64,{png_b64}",
+                                       "detail": "high"}},
+                        {"type": "text", "text": prompt},
+                    ],
+                }],
+            },
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+
+
+def _pil_to_png_b64(img) -> str:
+    from PIL import Image  # noqa: F811
+    import base64
+    img.thumbnail((_VISION_MAX_PX, _VISION_MAX_PX))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _normalize_to_uint8(arr):
+    import numpy as np
+    arr = arr.astype(np.float32)
+    mn, mx = arr.min(), arr.max()
+    if mx == mn:
+        return np.zeros_like(arr, dtype=np.uint8)
+    return ((arr - mn) / (mx - mn) * 255).astype(np.uint8)
+
+
+def _apply_wl(arr, wc: float, ww: float):
+    import numpy as np
+    low, high = wc - ww / 2, wc + ww / 2
+    return np.clip((arr.astype(np.float32) - low) / (ww) * 255, 0, 255).astype(np.uint8)
+
+
+async def _extract_image_text(filename: str, data: bytes, ext: str) -> tuple[str, dict]:
+    """
+    Returns (text, image_props) for all image formats.
+    text      — descriptive string ready for chunking
+    image_props — flat dict stored on the Neo4j Document node as image_* fields
+    """
+    import base64
+
+    # ── DICOM ──────────────────────────────────────────────────────────────────
+    if ext in (".dcm", ".dicom"):
+        try:
+            import pydicom
+            from PIL import Image
+            import numpy as np
+
+            ds = pydicom.dcmread(io.BytesIO(data), force=True)
+
+            def _tag(attr, default=""):
+                v = getattr(ds, attr, default)
+                return str(v).strip() if v else default
+
+            def _flt(attr):
+                try:
+                    v = getattr(ds, attr, None)
+                    if v is None:
+                        return None
+                    if hasattr(v, "__iter__") and not isinstance(v, str):
+                        v = list(v)[0]
+                    return float(v)
+                except Exception:
+                    return None
+
+            modality    = _tag("Modality")
+            study_desc  = _tag("StudyDescription")
+            series_desc = _tag("SeriesDescription")
+            institution = _tag("InstitutionName")
+            manufacturer = _tag("Manufacturer")
+            protocol    = _tag("ProtocolName")
+            rows        = _tag("Rows")
+            cols        = _tag("Columns")
+            bits        = _tag("BitsStored")
+            n_frames    = int(getattr(ds, "NumberOfFrames", 1) or 1)
+            photometric = _tag("PhotometricInterpretation")
+            slice_thick = _tag("SliceThickness")
+            pixel_sp    = _tag("PixelSpacing")
+            kvp         = _tag("KVP")
+
+            image_props = {
+                "image_format": "DICOM",
+                "image_modality": modality,
+                "image_study_description": study_desc,
+                "image_series_description": series_desc,
+                "image_institution": institution,
+                "image_manufacturer": manufacturer,
+                "image_protocol": protocol,
+                "image_rows": rows, "image_cols": cols,
+                "image_bits": bits, "image_frames": str(n_frames),
+                "image_photometric": photometric,
+                "image_slice_thickness_mm": slice_thick,
+                "image_pixel_spacing_mm": pixel_sp,
+                "image_kvp": kvp,
+            }
+
+            meta_lines = [
+                f"[MEDICAL IMAGE: DICOM{f' / {modality}' if modality else ''}]",
+                "",
+                "=== DICOM METADATA ===",
+                f"Modality            : {modality}" if modality else None,
+                f"Study Description   : {study_desc}" if study_desc else None,
+                f"Series Description  : {series_desc}" if series_desc else None,
+                f"Institution         : {institution}" if institution else None,
+                f"Manufacturer        : {manufacturer}" if manufacturer else None,
+                f"Protocol            : {protocol}" if protocol else None,
+                f"KVP                 : {kvp} kV" if kvp else None,
+                f"Slice Thickness     : {slice_thick} mm" if slice_thick else None,
+                f"Pixel Spacing       : {pixel_sp} mm" if pixel_sp else None,
+                f"Dimensions          : {cols} × {rows} px" if rows and cols else None,
+                f"Frames              : {n_frames}" if n_frames > 1 else None,
+                f"Bit Depth           : {bits}-bit" if bits else None,
+                f"Photometric         : {photometric}" if photometric else None,
+            ]
+            meta_text = "\n".join(l for l in meta_lines if l is not None)
+
+            # Pixel rendering
+            vision_text = ""
+            try:
+                px = ds.pixel_array  # (rows, cols) or (frames, rows, cols)
+                if px.ndim == 3:
+                    px = px[px.shape[0] // 2]  # middle frame
+
+                wc = _flt("WindowCenter")
+                ww = _flt("WindowWidth")
+                gray8 = _apply_wl(px, wc, ww) if (wc is not None and ww and ww > 0) \
+                    else _normalize_to_uint8(px)
+
+                # Handle RGB DICOM
+                if gray8.ndim == 3:
+                    img = Image.fromarray(gray8)
+                else:
+                    img = Image.fromarray(gray8, mode="L")
+
+                b64 = _pil_to_png_b64(img)
+                prompt = (
+                    f"This is a medical DICOM image (modality: {modality or 'unknown'}). "
+                    "Describe clinically: (1) anatomical region and structures visible, "
+                    "(2) notable findings or abnormalities (describe objectively, do not diagnose), "
+                    "(3) image orientation and quality, (4) any visible text, annotations, "
+                    "measurements, or overlays."
+                )
+                vision_text = await _call_vision_api(b64, prompt)
+            except Exception as e:
+                vision_text = f"[Pixel rendering failed: {e}]"
+
+            text = meta_text
+            if vision_text:
+                text += f"\n\n=== VISUAL ANALYSIS ===\n{vision_text}"
+            return text, {k: v for k, v in image_props.items() if v}
+
+        except ImportError as e:
+            raise RuntimeError(
+                f"Missing dependency for DICOM: {e}. "
+                "Run: pip install pydicom Pillow numpy"
+            )
+
+    # ── NIfTI ──────────────────────────────────────────────────────────────────
+    if ext in (".nii", ".nii.gz"):
+        try:
+            import nibabel as nib
+            import numpy as np
+            import tempfile
+            from PIL import Image
+
+            suffix = ".nii.gz" if ext == ".nii.gz" else ".nii"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(data)
+                tmp_path = tmp.name
+            try:
+                nii = nib.load(tmp_path)
+                hdr = nii.header
+                shape = nii.shape  # (nx, ny, nz[, nt])
+                vox   = hdr.get_zooms()
+                dtype = str(hdr.get_data_dtype())
+                descr = hdr.get("descrip", b"").tobytes().decode("utf-8", errors="replace").strip("\x00").strip()
+            finally:
+                os.unlink(tmp_path)
+
+            nx, ny, nz = (shape + (1, 1))[:3]
+            nt = shape[3] if len(shape) > 3 else 1
+            dx, dy, dz = (vox + (0, 0, 0))[:3]
+
+            image_props = {
+                "image_format": "NIfTI",
+                "image_dims": f"{nx}x{ny}x{nz}" + (f"x{nt}" if nt > 1 else ""),
+                "image_voxel_size_mm": f"{dx:.3f}x{dy:.3f}x{dz:.3f}",
+                "image_dtype": dtype,
+                "image_description": descr,
+            }
+
+            meta_text = "\n".join(filter(None, [
+                "[MEDICAL IMAGE: NIfTI]",
+                "",
+                "=== NIfTI HEADER ===",
+                f"Dimensions   : {nx} × {ny} × {nz}" + (f" × {nt} (time)" if nt > 1 else ""),
+                f"Voxel Size   : {dx:.3f} × {dy:.3f} × {dz:.3f} mm",
+                f"Data Type    : {dtype}",
+                f"Description  : {descr}" if descr else None,
+            ]))
+
+            vision_text = ""
+            try:
+                arr = nii.get_fdata()
+                if arr.ndim >= 3:
+                    sl = arr[:, :, arr.shape[2] // 2]
+                elif arr.ndim == 2:
+                    sl = arr
+                else:
+                    raise ValueError("Unexpected NIfTI array shape")
+                gray8 = _normalize_to_uint8(sl)
+                img = Image.fromarray(gray8, mode="L")
+                b64 = _pil_to_png_b64(img)
+                prompt = (
+                    "This is a medical neuroimaging image (NIfTI format). "
+                    "Describe: (1) visible brain structures or anatomy, (2) any notable "
+                    "features, signal intensities, or abnormalities, (3) image plane and "
+                    "orientation, (4) image quality and contrast."
+                )
+                vision_text = await _call_vision_api(b64, prompt)
+            except Exception as e:
+                vision_text = f"[Slice rendering failed: {e}]"
+
+            text = meta_text
+            if vision_text:
+                text += f"\n\n=== VISUAL ANALYSIS ===\n{vision_text}"
+            return text, {k: v for k, v in image_props.items() if v}
+
+        except ImportError as e:
+            raise RuntimeError(
+                f"Missing dependency for NIfTI: {e}. "
+                "Run: pip install nibabel numpy Pillow"
+            )
+
+    # ── Regular images ──────────────────────────────────────────────────────────
+    try:
+        from PIL import Image
+        import base64
+
+        img = Image.open(io.BytesIO(data))
+        width, height = img.size
+        mode  = img.mode
+        fmt   = img.format or ext.lstrip(".")
+
+        image_props = {
+            "image_format": fmt.upper(),
+            "image_width":  str(width),
+            "image_height": str(height),
+            "image_mode":   mode,
+        }
+
+        # Convert to RGB PNG for vision
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        b64 = _pil_to_png_b64(img)
+
+        prompt = (
+            "Describe this image in detail: (1) main subject and overall content, "
+            "(2) any text, labels, annotations, or measurements visible, "
+            "(3) key visual elements, colors, or patterns, "
+            "(4) context or apparent purpose."
+        )
+        vision_text = await _call_vision_api(b64, prompt)
+
+        text = "\n".join([
+            f"[IMAGE: {fmt.upper()}  {width}×{height}px]",
+            "",
+            vision_text or "[Vision analysis skipped]",
+        ])
+        return text, image_props
+
+    except ImportError as e:
+        raise RuntimeError(f"Missing dependency for images: {e}. Run: pip install Pillow")
 
 _UPLOAD_FORM = """<!doctype html>
 <html lang="en">
@@ -1443,8 +2326,8 @@ _UPLOAD_FORM = """<!doctype html>
   <p>Upload a file to index it into Neo4j + Qdrant for GCOR retrieval.</p>
   <form method="POST" enctype="multipart/form-data">
     <label>File</label>
-    <input type="file" name="file" accept=".txt,.md,.pdf,.docx,.json,.csv" required>
-    <p class="accepted">Accepted: .txt .md .pdf .docx .json .csv</p>
+    <input type="file" name="file" accept=".txt,.md,.pdf,.docx,.json,.csv,.jpg,.jpeg,.png,.gif,.bmp,.webp,.tiff,.tif,.avif,.dcm,.dicom,.nii" required>
+    <p class="accepted">Accepted: .txt .md .pdf .docx .json .csv · images: .jpg .png .webp .tiff · medical: .dcm .dicom .nii .nii.gz</p>
     <label>Title (optional — defaults to filename)</label>
     <input type="text" name="title" placeholder="My Document">
     <label>Agent ID (optional — leave blank for shared knowledge)</label>
@@ -1517,7 +2400,8 @@ def _chunk_text(text: str, size: int = 2000, overlap: int = 200) -> list[str]:
 
 
 async def _neo4j_ingest(doc_id: str, title: str, source: str,
-                        chunks: list[str], agent_id: str, access_level: str):
+                        chunks: list[str], agent_id: str, access_level: str,
+                        image_props: dict | None = None):
     driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
     now = _now_iso()
     try:
@@ -1527,10 +2411,13 @@ async def _neo4j_ingest(doc_id: str, title: str, source: str,
                      document_id: $doc_id, title: $title, source: $source,
                      agent_id: $agent_id, access_level: $access_level,
                      chunk_count: $cc, created_at: $now
-                   }) RETURN elementId(d) AS eid""",
+                   })
+                   SET d += $image_props
+                   RETURN elementId(d) AS eid""",
                 doc_id=doc_id, title=title, source=source,
                 agent_id=agent_id, access_level=access_level,
                 cc=len(chunks), now=now,
+                image_props=image_props or {},
             )
             doc_eid = (await doc_rec.single())["eid"]
 
@@ -1560,20 +2447,14 @@ async def _qdrant_ingest(collection: str, chunks: list[str], chunk_eids: list[st
                          doc_id: str, title: str, agent_id: str, access_level: str):
     now = _now_iso()
 
-    # Embed in batches of 96
+    # Embed in batches with retry + inter-batch delay
     all_vectors: list[list[float]] = []
-    for i in range(0, len(chunks), 96):
-        batch = chunks[i:i + 96]
-        async with httpx.AsyncClient(timeout=60) as c:
-            resp = await c.post(
-                "https://api.openai.com/v1/embeddings",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                json={"input": batch, "model": EMBEDDING_MODEL},
-            )
-            resp.raise_for_status()
-            data = resp.json()["data"]
-            data.sort(key=lambda x: x["index"])
-            all_vectors.extend(d["embedding"] for d in data)
+    for i in range(0, len(chunks), EMBED_BATCH_SIZE):
+        batch = chunks[i:i + EMBED_BATCH_SIZE]
+        vecs = await _embed_batch(batch)
+        all_vectors.extend(vecs)
+        if i + EMBED_BATCH_SIZE < len(chunks):
+            await asyncio.sleep(EMBED_BATCH_DELAY)
 
     # Ensure collection exists
     async with httpx.AsyncClient(timeout=30) as c:
@@ -1630,22 +2511,26 @@ async def ingest_document(
     access_level: str = Form("public"),
 ):
     filename = file.filename or "upload"
-    ext = os.path.splitext(filename)[1].lower()
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    ext = _resolve_ext(filename, data)
     if ext not in _INGEST_ACCEPT:
         raise HTTPException(
             status_code=415,
             detail=f"Unsupported file type '{ext}'. Accepted: {', '.join(sorted(_INGEST_ACCEPT))}",
         )
 
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty file")
-
-    doc_title = title.strip() or filename
-    doc_id = hashlib.md5(f"{filename}-{datetime.now().isoformat()}".encode()).hexdigest()[:16]
+    doc_title   = title.strip() or filename
+    doc_id      = hashlib.md5(f"{filename}-{datetime.now().isoformat()}".encode()).hexdigest()[:16]
+    image_props: dict = {}
 
     try:
-        text = _extract_text(filename, data)
+        if _is_image(ext):
+            text, image_props = await _extract_image_text(filename, data, ext)
+        else:
+            text = _extract_text(filename, data)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Text extraction failed: {exc}")
 
@@ -1657,11 +2542,11 @@ async def ingest_document(
     if not chunks:
         raise HTTPException(status_code=422, detail="File produced no chunks after extraction")
 
-    logger.info("Ingest '%s': %d chars → %d chunks", doc_title, len(text), len(chunks))
+    logger.info("Ingest '%s': %d chars → %d chunks (ext=%s)", doc_title, len(text), len(chunks), ext)
 
     try:
         doc_eid, chunk_eids = await _neo4j_ingest(
-            doc_id, doc_title, filename, chunks, agent_id, access_level
+            doc_id, doc_title, filename, chunks, agent_id, access_level, image_props
         )
     except Exception as exc:
         logger.error("Neo4j ingest failed: %s", exc)

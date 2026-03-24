@@ -13,14 +13,15 @@ User
  │     └─► GCOR Proxy (port 5001)
  │           ├─► Qdrant  (port 6333)   ← semantic search  (vector perception)
  │           ├─► Neo4j   (port 7687)   ← knowledge graph  (cognitive backbone)
- │           └─► LLM API (OpenAI / Anthropic)
+ │           └─► LLM API (OpenAI / Anthropic / Ollama)
  │
  └─► OpenClaw Agent (localhost:18799)  ← agentic interface with tools
+       ├─► relay (embedded, :18799→:18789, :18801→:18790, metrics :9091)
        ├─► mcp-qdrant (port 8765)  ──► Qdrant
        └─► mcp-neo4j  (port 8766)  ──► Neo4j
 
 Monitoring
- ├─► Prometheus (localhost:9090)   ← scrapes proxy + qdrant metrics every 15s
+ ├─► Prometheus (localhost:9090)   ← scrapes proxy + qdrant + openclaw metrics every 15s
  └─► Grafana    (localhost:3000)   ← auto-provisioned GCOR observability dashboard
 ```
 
@@ -81,7 +82,7 @@ Required variables:
 | Variable | Description |
 |---|---|
 | `OPENAI_API_KEY` | OpenAI API key — used for LLM calls and embeddings |
-| `ANTHROPIC_API_KEY` | Anthropic API key — optional fallback LLM |
+| `ANTHROPIC_API_KEY` | Anthropic API key — used by the GCOR proxy and OpenClaw |
 | `OPENCLAW_GATEWAY_TOKEN` | Token for OpenClaw gateway authentication |
 | `OPENCLAW_GATEWAY_PASSWORD` | Password for OpenClaw gateway |
 
@@ -89,10 +90,13 @@ Optional cognitive knobs:
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_BACKEND` | `openai` | Primary LLM: `openai` or `anthropic` |
+| `LLM_BACKEND` | `openai` | GCOR proxy LLM backend: `openai`, `anthropic`, or `ollama` |
 | `OPENAI_CHAT_MODEL` | `gpt-4o` | OpenAI model for chat completions |
 | `ANTHROPIC_CHAT_MODEL` | `claude-sonnet-4-6` | Anthropic model for chat completions |
+| `OLLAMA_MODEL` | `llama3.2` | Ollama model for local inference |
+| `EMBEDDING_BACKEND` | `openai` | Embedding provider: `openai` or `ollama` |
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI embedding model |
+| `OLLAMA_EMBEDDING_MODEL` | `nomic-embed-text` | Ollama embedding model (when `EMBEDDING_BACKEND=ollama`) |
 | `QDRANT_COLLECTION` | `documents` | Default Qdrant collection name |
 | `QDRANT_TOP_K` | `8` | Number of semantic search results |
 | `ENABLE_RAG` | `true` | Set `false` to disable GCOR and use plain LLM |
@@ -110,16 +114,16 @@ Optional cognitive knobs:
 eedgeai/
 ├── docker-compose.unified.yml
 ├── .env.example
-├── openclaw-config/
-│   └── openclaw.json              ← OpenClaw config (gateway mode + default model)
 ├── openclaw/
-│   ├── Dockerfile                 ← extends openclaw base image
+│   ├── Dockerfile                 ← extends openclaw base image (build context: project root)
+│   ├── entrypoint.sh              ← starts embedded relay then execs openclaw
 │   ├── package.json               ← neo4j-driver, qdrant client, pdf-parse, mammoth
 │   ├── neo4j.js                   ← neo4j-cli  (shell tool for OpenClaw agent)
 │   ├── qdrant.js                  ← qdrant-cli (shell tool for OpenClaw agent)
 │   └── ingest.js                  ← ingest-cli (document ingestion tool)
 ├── openclaw-relay/
-│   └── relay.js                   ← TCP relay: 18799→18789, 18801→18790
+│   └── relay.js                   ← TCP relay (embedded in openclaw container): 18799→18789, 18801→18790, metrics :9091
+├── neo4j-exporter/                ← Prometheus exporter for Neo4j Community Edition
 ├── mcp-servers/
 │   ├── qdrant/
 │   │   ├── Dockerfile
@@ -174,11 +178,12 @@ docker compose -f docker-compose.unified.yml ps
 |---|---|---|
 | `openwebui` | 8080 | Chat UI — select **openclaw** model |
 | `proxy` | 5001 | GCOR pipeline + Knowledge UI + `/metrics` |
-| `openclaw` | 18799 | OpenClaw agent web interface |
-| `openclaw-relay` | (shared) | TCP relay (18799→18789, 18801→18790) |
+| `openclaw` | 18799, 18801, 9091 | OpenClaw agent UI + embedded relay + relay metrics |
+| `ollama` | 11434 | Local LLM server |
 | `mcp-qdrant` | 8765 (internal) | MCP server — Qdrant tools for OpenClaw |
 | `mcp-neo4j` | 8766 (internal) | MCP server — Neo4j tools for OpenClaw |
 | `neo4j` | 7474, 7687 | Graph database |
+| `neo4j-exporter` | (internal) | Prometheus exporter for Neo4j Community Edition |
 | `qdrant` | 6333 | Vector database + `/metrics` |
 | `prometheus` | 9090 | Metrics collection |
 | `grafana` | 3000 | Observability dashboard |
@@ -263,7 +268,19 @@ Open **http://localhost:18799**:
 - Full agentic interface with tool use
 - Native access to `neo4j-cli`, `qdrant-cli`, and `ingest-cli` as shell tools
 - Connects to Neo4j and Qdrant via MCP sidecar servers
-- Default model: `openai/gpt-4o` (configured in `openclaw-config/openclaw.json`)
+- Default model: `anthropic/claude-sonnet-4-6`
+
+To change the default model:
+```bash
+docker exec eedgeai-openclaw-1 openclaw models set anthropic/claude-sonnet-4-6
+# or list all available (authenticated) models:
+docker exec eedgeai-openclaw-1 openclaw models list --all
+```
+
+To configure Anthropic authentication (first-time setup):
+```bash
+docker exec -it eedgeai-openclaw-1 openclaw models auth setup-token --provider anthropic
+```
 
 ---
 
@@ -315,6 +332,7 @@ The **EedgeAI — GCOR Full Observability** dashboard is auto-provisioned with 3
 |---|---|---|
 | `proxy:5001` | `proxy` | `/metrics` |
 | `qdrant:6333` | `qdrant` | `/metrics` |
+| `openclaw:9091` | `openclaw` | `/metrics` — gateway up/down, connection counters |
 
 > **Neo4j metrics:** Prometheus scraping of Neo4j requires **Neo4j Enterprise Edition**. Community edition does not expose a Prometheus endpoint. To enable when using Enterprise: add `NEO4J_server_metrics_prometheus_enabled: "true"` to the `neo4j` service in `docker-compose.unified.yml`, expose port `2004`, and uncomment the `neo4j` job in `monitoring/prometheus.yml`.
 
@@ -357,14 +375,17 @@ docker compose -f docker-compose.unified.yml down -v
 ```bash
 docker compose -f docker-compose.unified.yml build <service>
 docker compose -f docker-compose.unified.yml up -d <service>
-
-# After restarting openclaw, always recreate the relay:
-docker compose -f docker-compose.unified.yml up -d --force-recreate openclaw-relay
 ```
 
-> ⚠️ **Important:** Every time the `openclaw` container restarts, the `openclaw-relay` must be force-recreated. The relay shares openclaw's network namespace — when openclaw gets a new namespace on restart, the relay's reference goes stale (`ERR_EMPTY_RESPONSE` on port 18799). Always run the force-recreate command above after any openclaw restart.
-
 > ⚠️ **Important:** When Grafana is force-recreated (fresh container), it starts with an empty database and re-provisions the datasource and dashboard from the `monitoring/grafana-provisioning/` files automatically.
+
+### Updating OpenClaw
+
+```bash
+docker pull ghcr.io/openclaw/openclaw:latest
+docker compose -f docker-compose.unified.yml build openclaw
+docker compose -f docker-compose.unified.yml up -d --no-deps openclaw
+```
 
 ---
 
@@ -372,9 +393,9 @@ docker compose -f docker-compose.unified.yml up -d --force-recreate openclaw-rel
 
 **OpenClaw shows `ERR_EMPTY_RESPONSE` on port 18799:**
 ```bash
-docker compose -f docker-compose.unified.yml up -d --force-recreate openclaw-relay
+docker compose -f docker-compose.unified.yml up -d --no-deps openclaw
 ```
-This happens every time the `openclaw` container is restarted. The relay must be recreated to attach to the new network namespace.
+The relay is embedded inside the openclaw container — simply restarting the container is sufficient.
 
 **OpenWebUI shows no models / only one model:**
 ```bash
@@ -400,15 +421,13 @@ Neo4j takes 30–60 s to initialise. Wait and retry. Check health:
 docker compose -f docker-compose.unified.yml logs neo4j | tail -20
 ```
 
-**OpenClaw LLM errors (credit / billing):**
-OpenClaw defaults to `openai/gpt-4o`. To switch models:
+**OpenClaw LLM errors (rate limit / billing):**
+OpenClaw defaults to `anthropic/claude-sonnet-4-6`. To switch models:
 ```bash
-# From inside the container
-docker exec eedgeai-openclaw-1 openclaw models set openai/gpt-4o
-# Or edit openclaw-config/openclaw.json:
-# { "gateway": { "mode": "local" }, "agents": { "defaults": { "model": "openai/gpt-4o" } } }
+docker exec eedgeai-openclaw-1 openclaw models set anthropic/claude-sonnet-4-6
+# List all available authenticated models:
+docker exec eedgeai-openclaw-1 openclaw models list
 ```
-> Note: `openclaw-config/openclaw.json` is mounted read-only. Edit the host file and restart openclaw + relay.
 
 **MCP servers not responding (OpenClaw tools fail):**
 ```bash

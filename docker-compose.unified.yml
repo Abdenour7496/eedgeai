@@ -20,6 +20,18 @@ services:
       retries: 8
       start_period: 30s
 
+  neo4j-exporter:
+    build: ./neo4j-exporter
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: test1234
+      NEO4J_DATABASE: neo4j
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    restart: unless-stopped
+
   qdrant:
     image: qdrant/qdrant:latest
     ports:
@@ -32,6 +44,44 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+
+  # ── Ollama (local LLM) ────────────────────────────────────────────────────────
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # Uncomment to enable NVIDIA GPU acceleration:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  ollama-init:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        ollama pull ${OLLAMA_MODEL:-llama3.2} &&
+        ollama pull ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
+    restart: "no"
 
   # ── MCP servers (SSE) — expose graph + vector DBs to OpenClaw ─────────────────
 
@@ -76,16 +126,20 @@ services:
   # ── OpenClaw + relay ──────────────────────────────────────────────────────────
 
   openclaw:
-    build: ./openclaw
+    build:
+      context: .
+      dockerfile: openclaw/Dockerfile
     depends_on:
       - mcp-qdrant
       - mcp-neo4j
     ports:
       - "18799:18799"
       - "18801:18801"
+      - "9091:9091"
     environment:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       OPENCLAW_GATEWAY_PORT: ${OPENCLAW_GATEWAY_PORT:-18789}
       OPENCLAW_BRIDGE_PORT: ${OPENCLAW_BRIDGE_PORT:-18790}
       OPENCLAW_GATEWAY_BIND: ${OPENCLAW_GATEWAY_BIND:-lan}
@@ -103,17 +157,6 @@ services:
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
     volumes:
       - ${OPENCLAW_CONFIG_DIR:-openclaw_config}:/home/node/.openclaw
-      - ./openclaw-config/openclaw.json:/home/node/.openclaw/openclaw.json:ro
-
-  openclaw-relay:
-    image: ghcr.io/openclaw/openclaw:latest
-    network_mode: "service:openclaw"
-    depends_on:
-      - openclaw
-    entrypoint: node
-    command: /relay/relay.js
-    volumes:
-      - ./openclaw-relay:/relay
     restart: unless-stopped
 
   # ── GCOR Proxy ────────────────────────────────────────────────────────────────
@@ -127,13 +170,21 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_healthy
+      ollama:
+        condition: service_healthy
     environment:
-      # LLM backend
+      # LLM backend — set LLM_BACKEND=ollama to use local models
       LLM_BACKEND: ${LLM_BACKEND:-openai}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       OPENAI_CHAT_MODEL: ${OPENAI_CHAT_MODEL:-gpt-4o}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       ANTHROPIC_CHAT_MODEL: ${ANTHROPIC_CHAT_MODEL:-claude-sonnet-4-6}
+      # Ollama
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2}
+      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
+      # Embedding backend — set EMBEDDING_BACKEND=ollama to use nomic-embed-text locally
+      EMBEDDING_BACKEND: ${EMBEDDING_BACKEND:-openai}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
       # Qdrant
       QDRANT_URL: http://qdrant:6333
@@ -171,10 +222,14 @@ services:
       RAG_OPENAI_API_KEY: openclaw
       ENABLE_RAG_LOCAL_WEB_FETCH: "false"
       RESET_CONFIG_ON_START: "true"
+      # Ollama — lets OpenWebUI use local models directly in addition to the proxy
+      OLLAMA_BASE_URL: http://ollama:11434
     volumes:
       - openwebui_data:/app/backend/data
     depends_on:
       proxy:
+        condition: service_healthy
+      ollama:
         condition: service_healthy
 
   # ── Monitoring ────────────────────────────────────────────────────────────────
@@ -203,3 +258,4 @@ volumes:
   qdrant_data:
   openclaw_config:
   openwebui_data:
+  ollama_data:

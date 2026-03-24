@@ -3,10 +3,25 @@
   "version": "1.0.0",
   "private": true,
   "description": "Neo4j and Qdrant driver layer for OpenClaw",
+  "scripts": {
+    "memory:sync":           "node memory-sync.js",
+    "memory:sync:dry":       "node memory-sync.js --dry-run",
+    "memory:watch":          "node memory-watch.js",
+    "memory:serve":          "node memory-server.js",
+    "memory:query:semantic": "node memory-query.js semantic",
+    "memory:query:graph":    "node memory-query.js graph",
+    "memory:query:hybrid":   "node memory-query.js hybrid",
+    "memory:query:compound": "node memory-query.js compound",
+    "memory:feedback":       "node memory-query.js feedback",
+    "memory:stats":          "node memory-query.js stats"
+  },
   "dependencies": {
     "neo4j-driver": "^5.27.0",
     "@qdrant/js-client-rest": "^1.13.0",
     "pdf-parse": "^1.1.1",
-    "mammoth": "^1.8.0"
+    "mammoth": "^1.8.0",
+    "dicom-parser": "^1.8.21",
+    "sharp": "^0.33.5",
+    "nifti-reader-js": "^0.6.6"
   }
 }

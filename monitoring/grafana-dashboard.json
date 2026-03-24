@@ -919,6 +919,314 @@
       }
     },
     {
+      "id": 50,
+      "type": "row",
+      "title": "Neo4j Graph Database",
+      "gridPos": {
+        "x": 0,
+        "y": 52,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false
+    },
+    {
+      "id": 51,
+      "type": "stat",
+      "title": "Neo4j Up",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 53,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "up{job=\"neo4j\"}",
+          "legendFormat": "neo4j"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "red",
+              "value": 0
+            },
+            {
+              "color": "green",
+              "value": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 52,
+      "type": "stat",
+      "title": "Bolt Connections",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 4,
+        "y": 53,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "neo4j_bolt_connections_running",
+          "legendFormat": "active"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "green",
+              "value": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 53,
+      "type": "stat",
+      "title": "Transactions Committed (1h)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 53,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "increase(neo4j_transaction_committed_total[1h])",
+          "legendFormat": "committed"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "green",
+              "value": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 54,
+      "type": "stat",
+      "title": "Page Cache Hit Ratio",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 53,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "rate(neo4j_page_cache_hits_total[5m]) / (rate(neo4j_page_cache_hits_total[5m]) + rate(neo4j_page_cache_faults_total[5m]) + 0.001)",
+          "legendFormat": "hit ratio"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "unit": "percentunit",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "red",
+              "value": 0
+            },
+            {
+              "color": "orange",
+              "value": 0.8
+            },
+            {
+              "color": "green",
+              "value": 0.95
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 55,
+      "type": "stat",
+      "title": "DB Store Size",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 53,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "neo4j_database_store_size_database",
+          "legendFormat": "size"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "unit": "bytes",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "green",
+              "value": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 56,
+      "type": "stat",
+      "title": "Open Transactions",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 53,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "neo4j_transaction_active",
+          "legendFormat": "open"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "green",
+              "value": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 57,
+      "type": "timeseries",
+      "title": "Transaction Rate",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 57,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "rate(neo4j_transaction_committed_total[1m])",
+          "legendFormat": "committed/s"
+        },
+        {
+          "expr": "rate(neo4j_transaction_rollbacks_total[1m])",
+          "legendFormat": "rollbacks/s"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list"
+        }
+      }
+    },
+    {
+      "id": 58,
+      "type": "timeseries",
+      "title": "Page Cache Hits vs Faults",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 57,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "rate(neo4j_page_cache_hits_total[1m])",
+          "legendFormat": "hits/s"
+        },
+        {
+          "expr": "rate(neo4j_page_cache_faults_total[1m])",
+          "legendFormat": "faults/s"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list"
+        }
+      }
+    },
+    {
       "id": 60,
       "type": "row",
       "title": "Qdrant Vector Database",
@@ -1164,18 +1472,235 @@
       }
     },
     {
-      "id": 50,
-      "type": "text",
-      "title": "Neo4j Metrics",
+      "id": 80,
+      "type": "row",
+      "title": "OpenClaw Gateway",
       "gridPos": {
         "x": 0,
-        "y": 52,
+        "y": 96,
         "w": 24,
+        "h": 1
+      },
+      "collapsed": false
+    },
+    {
+      "id": 81,
+      "type": "stat",
+      "title": "OpenClaw Up",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 97,
+        "w": 4,
         "h": 4
       },
+      "targets": [
+        {
+          "expr": "openclaw_up",
+          "legendFormat": "health"
+        }
+      ],
       "options": {
-        "mode": "markdown",
-        "content": "> **Neo4j Prometheus metrics** require **Neo4j Enterprise Edition**. Community edition does not expose a Prometheus endpoint.\n>\n> To enable: upgrade to Enterprise, add  to the neo4j service in docker-compose, expose port 2004, and uncomment the  job in ."
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "red",
+              "value": 0
+            },
+            {
+              "color": "green",
+              "value": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 82,
+      "type": "stat",
+      "title": "Gateway Active Connections",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 4,
+        "y": 97,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "openclaw_gateway_connections_active",
+          "legendFormat": "active"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "green",
+              "value": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 83,
+      "type": "stat",
+      "title": "Portal Active Connections",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 97,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "openclaw_portal_connections_active",
+          "legendFormat": "active"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "green",
+              "value": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 84,
+      "type": "stat",
+      "title": "Health Check Failures (1h)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 97,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "increase(openclaw_health_failures_total[1h])",
+          "legendFormat": "failures"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "thresholds": {
+          "steps": [
+            {
+              "color": "green",
+              "value": 0
+            },
+            {
+              "color": "orange",
+              "value": 1
+            },
+            {
+              "color": "red",
+              "value": 5
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 85,
+      "type": "timeseries",
+      "title": "OpenClaw Connection Rate",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 101,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "rate(openclaw_gateway_connections_total[1m])",
+          "legendFormat": "gateway conn/s"
+        },
+        {
+          "expr": "rate(openclaw_portal_connections_total[1m])",
+          "legendFormat": "portal conn/s"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list"
+        }
+      }
+    },
+    {
+      "id": 86,
+      "type": "timeseries",
+      "title": "OpenClaw Active Connections",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 101,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "openclaw_gateway_connections_active",
+          "legendFormat": "gateway"
+        },
+        {
+          "expr": "openclaw_portal_connections_active",
+          "legendFormat": "portal"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list"
+        }
       }
     }
   ]

@@ -73,10 +73,32 @@ const collection    = flags.collection    || DEFAULT_COLLECTION;
 const CHUNK_SIZE    = parseInt(flags.chunkSize    || '2000', 10);
 const CHUNK_OVERLAP = parseInt(flags.chunkOverlap || '200',  10);
 
+// Image-specific flags
+if (flags.visionBackend)  process.env.VISION_BACKEND  = flags.visionBackend;
+if (flags.visionModel)    process.env.VISION_MODEL    = flags.visionModel;
+if (flags.noVision)       process.env.NO_VISION       = '1';
+
 // ── Text extraction ───────────────────────────────────────────────────────────
+
+const { extractImageText, SUPPORTED_EXTENSIONS: IMAGE_EXTS, isDicom } =
+  require('./image-extractor');
+
+// Holds structured metadata set during image extraction; read by main()
+let _imageMetadata = null;
 
 async function extractText(fp, rawBuffer) {
   const ext = (fp ? path.extname(fp) : '.txt').toLowerCase();
+
+  // ── Images (regular, DICOM, NIfTI) ──────────────────────────────────────────
+  // Dispatch on extension OR on DICOM magic bytes (files with no / wrong ext)
+  const isImageExt  = IMAGE_EXTS.includes(ext) || ext === '.nii';
+  const isDicomFile = isDicom(rawBuffer);
+
+  if (isImageExt || isDicomFile) {
+    const result = await extractImageText(rawBuffer, ext, fp || '');
+    _imageMetadata = result.metadata;
+    return result.text;
+  }
 
   if (ext === '.pdf') {
     try {
@@ -172,7 +194,7 @@ function embedTexts(texts) {
 
 // ── Neo4j ────────────────────────────────────────────────────────────────────
 
-async function neo4jIngest(documentId, title, source, chunks, agentId, accessLevel) {
+async function neo4jIngest(documentId, title, source, chunks, agentId, accessLevel, imageProps = {}) {
   const driver = neo4j.driver(NEO4J_URI, neo4j.auth.basic(NEO4J_USER, NEO4J_PASSWORD));
   try {
     await driver.verifyConnectivity();
@@ -180,7 +202,7 @@ async function neo4jIngest(documentId, title, source, chunks, agentId, accessLev
     try {
       const now = new Date().toISOString();
 
-      // Create Document node
+      // Create Document node, then merge any image-specific metadata fields
       const docResult = await session.run(
         `CREATE (d:Document {
            document_id:  $document_id,
@@ -190,7 +212,9 @@ async function neo4jIngest(documentId, title, source, chunks, agentId, accessLev
            access_level: $access_level,
            chunk_count:  $chunk_count,
            created_at:   $created_at
-         }) RETURN elementId(d) AS eid`,
+         })
+         SET d += $image_props
+         RETURN elementId(d) AS eid`,
         {
           document_id:  documentId,
           title,
@@ -199,6 +223,7 @@ async function neo4jIngest(documentId, title, source, chunks, agentId, accessLev
           access_level: accessLevel,
           chunk_count:  neo4j.int(chunks.length),
           created_at:   now,
+          image_props:  imageProps,
         }
       );
       const docEid = docResult.records[0].get('eid');
@@ -311,14 +336,23 @@ function md5Uuid(str) {
         'Usage: ingest-cli <file> [options]',
         '       echo "text" | ingest-cli --stdin --title "My Doc"',
         '',
+        'Supported formats:',
+        '  Text/docs  .txt .md .csv .json .pdf .docx',
+        '  Images     .jpg .jpeg .png .gif .bmp .webp .tiff .avif',
+        '  Medical    .dcm .dicom (DICOM)   .nii .nii.gz (NIfTI)',
+        '             DICOM files without extension auto-detected by magic bytes',
+        '',
         'Options:',
-        '  --title <str>         Document title (default: filename)',
-        '  --agent-id <str>      Agent partition (default: shared)',
-        '  --access-level <str>  public | restricted | agent:<id> (default: public)',
-        '  --collection <str>    Qdrant collection (default: documents)',
-        '  --chunk-size <n>      Characters per chunk (default: 2000)',
-        '  --chunk-overlap <n>   Overlap characters (default: 200)',
-        '  --stdin               Read from stdin instead of a file',
+        '  --title <str>            Document title (default: filename)',
+        '  --agent-id <str>         Agent partition (default: shared)',
+        '  --access-level <str>     public | restricted | agent:<id> (default: public)',
+        '  --collection <str>       Qdrant collection (default: documents)',
+        '  --chunk-size <n>         Characters per chunk (default: 2000)',
+        '  --chunk-overlap <n>      Overlap characters (default: 200)',
+        '  --stdin                  Read from stdin instead of a file',
+        '  --vision-backend <str>   openai (default) | anthropic',
+        '  --vision-model <str>     Override vision model (default: gpt-4o)',
+        '  --no-vision              Skip vision API call; store metadata only',
       ];
       process.stderr.write(JSON.stringify({ error: 'No input specified', usage: help }) + '\n');
       process.exit(1);
@@ -354,10 +388,25 @@ function md5Uuid(str) {
     const documentId = md5Uuid(`${source}-${Date.now()}`).replace(/-/g, '').slice(0, 16);
 
     process.stderr.write(`[ingest] "${title}" → ${textChunks.length} chunks\n`);
+    if (_imageMetadata) {
+      process.stderr.write(`[ingest] Image type: ${_imageMetadata.format}` +
+        (_imageMetadata.modality ? ` / ${_imageMetadata.modality}` : '') + '\n');
+    }
+
+    // Flatten image metadata into Neo4j-safe scalar props (no nested objects)
+    const imageProps = {};
+    if (_imageMetadata) {
+      for (const [k, v] of Object.entries(_imageMetadata)) {
+        if (v === null || v === undefined) continue;
+        imageProps[`image_${k}`] = Array.isArray(v) ? v.join(',') : String(v);
+      }
+    }
 
     // Neo4j
     process.stderr.write('[ingest] Writing to Neo4j...\n');
-    const { docEid, chunkEids } = await neo4jIngest(documentId, title, source, textChunks, agentId, accessLevel);
+    const { docEid, chunkEids } = await neo4jIngest(
+      documentId, title, source, textChunks, agentId, accessLevel, imageProps
+    );
 
     // Qdrant
     process.stderr.write('[ingest] Embedding and writing to Qdrant...\n');
@@ -372,6 +421,7 @@ function md5Uuid(str) {
       chunks:        textChunks.length,
       qdrant_points: upserted,
       collection,
+      ..._imageMetadata && { image_metadata: _imageMetadata },
     };
     process.stdout.write(JSON.stringify(result, null, 2) + '\n');
   } catch (err) {

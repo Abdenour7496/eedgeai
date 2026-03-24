@@ -238,6 +238,19 @@
       transition: color .15s, background .15s;
     }
     .btn-del-col:hover { color: #f87171; background: rgba(239,68,68,.1); }
+    .btn-doc-del {
+      flex-shrink: 0; background: none; border: 1px solid var(--card-border);
+      color: var(--text-muted); cursor: pointer; padding: 5px 7px; border-radius: 6px;
+      line-height: 1; transition: color .15s, border-color .15s, background .15s;
+    }
+    .btn-doc-del:hover { color: #f87171; border-color: #f87171; background: rgba(239,68,68,.07); }
+    .arc-tab {
+      padding: 5px 14px; background: none; border: 1px solid transparent;
+      border-radius: 6px; font-size: .8rem; color: var(--text-muted); cursor: pointer;
+      transition: color .15s, border-color .15s, background .15s;
+    }
+    .arc-tab:hover { color: var(--text-dim); }
+    .arc-tab-active { border-color: var(--card-border); color: var(--text-dim); background: rgba(255,255,255,.04); }
     .btn-delete {
       flex: 1; padding: 8px 0; background: transparent; color: var(--text-muted);
       border: 1px solid var(--card-border); border-radius: 20px; font-size: .8rem;
@@ -418,8 +431,8 @@
         <div class="drop-zone" id="drop-zone">
           <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>
           <p id="drop-label"><strong>Click to upload</strong> or drag &amp; drop</p>
-          <p style="font-size:.72rem;margin-top:4px;color:var(--text-muted)">.txt .md .pdf .docx .json .csv</p>
-          <input type="file" id="file-input" accept=".txt,.md,.pdf,.docx,.json,.csv" onchange="onFileSelected(this)">
+          <p style="font-size:.72rem;margin-top:4px;color:var(--text-muted)">.txt .md .pdf .docx .json .csv &nbsp;·&nbsp; .jpg .png .webp .tiff &nbsp;·&nbsp; .dcm .dicom .nii .nii.gz</p>
+          <input type="file" id="file-input" accept=".txt,.md,.pdf,.docx,.json,.csv,.jpg,.jpeg,.png,.gif,.bmp,.webp,.tiff,.tif,.avif,.dcm,.dicom,.nii,.nii.gz" onchange="onFileSelected(this)">
         </div>
       </div>
       <div class="form-group">
@@ -439,11 +452,23 @@
           </select>
         </div>
       </div>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;padding:10px 12px;background:var(--surface-2,#1a2235);border-radius:6px;border:1px solid var(--border,#2d3a50)">
+        <input type="checkbox" id="ingest-docint" style="width:auto;margin:0;accent-color:#7dd3fc">
+        <div>
+          <label for="ingest-docint" style="font-size:.85rem;color:var(--text,#e2e8f0);cursor:pointer;margin:0">
+            Document Intelligence
+          </label>
+          <div style="font-size:.72rem;color:var(--text-muted,#64748b);margin-top:2px">
+            OCR · table extraction · form fields · entities · classification
+          </div>
+        </div>
+      </div>
       <button id="ingest-submit" class="submit-btn" onclick="submitIngest()">
         ↑ &nbsp;Ingest Document
       </button>
       <div id="ingest-ok"  class="alert alert-ok"></div>
       <div id="ingest-err" class="alert alert-err"></div>
+      <div id="docint-result" style="display:none;margin-top:14px;font-size:.82rem;color:var(--text-muted,#94a3b8)"></div>
     </div>
   </div>
 </div>
@@ -485,9 +510,11 @@
       </h2>
       <button class="btn-close" onclick="closeModal('archives-modal')">✕</button>
     </div>
-    <div class="modal-body" id="archives-body">
-      <div class="spinner"></div>
+    <div style="display:flex;gap:4px;padding:0 20px 12px;border-bottom:1px solid var(--card-border)">
+      <button id="arc-tab-cols" class="arc-tab arc-tab-active" onclick="switchArcTab('collections')">Collections</button>
+      <button id="arc-tab-docs" class="arc-tab" onclick="switchArcTab('documents')">Documents</button>
     </div>
+    <div class="modal-body" id="archives-body"><div class="spinner"></div></div>
   </div>
 </div>
 
@@ -690,22 +717,67 @@
   }
 
   // ── View modal ─────────────────────────────────────────────────────────────
+  let _viewCol = null;
+
   async function openViewModal(name) {
+    _viewCol = name;
     document.getElementById('view-col-label').textContent = ' — ' + name;
+    document.getElementById('view-modal').classList.add('open');
+    await _loadViewDocs();
+  }
+
+  async function _loadViewDocs() {
     const body = document.getElementById('view-body');
     body.innerHTML = '<div class="spinner"></div>';
-    document.getElementById('view-modal').classList.add('open');
     try {
-      const r = await fetch(`/api/collections/${enc(name)}/docs`);
+      const r = await fetch(`/api/collections/${enc(_viewCol)}/docs`);
       const d = await r.json();
       if (!d.docs?.length) { body.innerHTML = '<p style="color:var(--text-muted);text-align:center;padding:20px;font-size:.85rem">No documents yet.</p>'; return; }
       body.innerHTML = d.docs.map(doc => `
-        <div class="result-item">
-          <div class="result-score">${esc(doc.title)}</div>
-          <div class="result-text" style="color:var(--text-muted)">${doc.chunk_count} chunk${doc.chunk_count !== 1 ? 's' : ''} &nbsp;·&nbsp; ${fmtDate(doc.created_at)}</div>
-          <div class="result-meta">ID: ${esc(doc.doc_id)} &nbsp;·&nbsp; access: ${esc(doc.access_level || 'public')}</div>
+        <div class="result-item" id="doc-row-${esc(doc.doc_id)}" style="display:flex;align-items:center;gap:10px">
+          <div style="flex:1;min-width:0">
+            <div class="result-score">${esc(doc.title)}</div>
+            <div class="result-text" style="color:var(--text-muted)">${doc.chunk_count} chunk${doc.chunk_count !== 1 ? 's' : ''} &nbsp;·&nbsp; ${fmtDate(doc.created_at)}</div>
+            <div class="result-meta">ID: ${esc(doc.doc_id)} &nbsp;·&nbsp; access: ${esc(doc.access_level || 'public')}</div>
+          </div>
+          <div id="doc-del-ctrl-${esc(doc.doc_id)}" style="display:flex;align-items:center;gap:6px;flex-shrink:0">
+            <button class="btn-doc-del" onclick="promptDeleteDoc('${esc(doc.doc_id)}')" title="Delete document">
+              <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+            </button>
+          </div>
         </div>`).join('');
     } catch (e) { body.innerHTML = `<p style="color:#f87171;font-size:.85rem">${e.message}</p>`; }
+  }
+
+  function promptDeleteDoc(docId) {
+    const ctrl = document.getElementById(`doc-del-ctrl-${docId}`);
+    if (!ctrl) return;
+    ctrl.innerHTML = `
+      <span style="font-size:.75rem;color:#f87171;white-space:nowrap">Delete?</span>
+      <button class="btn-doc-del" style="color:#f87171;border-color:#f87171" onclick="deleteDoc('${esc(docId)}', this)">Yes</button>
+      <button class="btn-doc-del" onclick="cancelDeleteDoc('${esc(docId)}')">No</button>`;
+  }
+
+  function cancelDeleteDoc(docId) {
+    const ctrl = document.getElementById(`doc-del-ctrl-${docId}`);
+    if (!ctrl) return;
+    ctrl.innerHTML = `
+      <button class="btn-doc-del" onclick="promptDeleteDoc('${esc(docId)}')" title="Delete document">
+        <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+      </button>`;
+  }
+
+  async function deleteDoc(docId, btn) {
+    btn.disabled = true;
+    btn.textContent = '…';
+    try {
+      const r = await fetch(`/api/collections/${enc(_viewCol)}/docs/${enc(docId)}`, { method: 'DELETE' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+      const row = document.getElementById(`doc-row-${docId}`);
+      if (row) { row.style.transition = 'opacity .3s'; row.style.opacity = '0'; setTimeout(() => row.remove(), 300); }
+      showToast(`✓ Archived "${d.title}" — recoverable from Archives`);
+    } catch (e) { showToast('✗ ' + e.message); cancelDeleteDoc(docId); }
   }
 
   // ── Ingest modal ───────────────────────────────────────────────────────────
@@ -725,26 +797,63 @@
   }
 
   async function submitIngest() {
-    const fi  = document.getElementById('file-input');
-    const ok  = document.getElementById('ingest-ok');
-    const err = document.getElementById('ingest-err');
-    const btn = document.getElementById('ingest-submit');
-    ok.style.display = err.style.display = 'none';
+    const fi      = document.getElementById('file-input');
+    const ok      = document.getElementById('ingest-ok');
+    const err     = document.getElementById('ingest-err');
+    const btn     = document.getElementById('ingest-submit');
+    const diPanel = document.getElementById('docint-result');
+    const useDocInt = document.getElementById('ingest-docint').checked;
+
+    ok.style.display = err.style.display = diPanel.style.display = 'none';
     if (!fi.files[0]) { err.textContent = 'Please select a file.'; err.style.display = 'block'; return; }
-    btn.disabled = true; btn.textContent = 'Ingesting…';
+
+    btn.disabled = true;
+    btn.textContent = useDocInt ? 'Running Document Intelligence…' : 'Ingesting…';
+
     const fd = new FormData();
-    fd.append('file',         fi.files[0]);
-    fd.append('title',        document.getElementById('ingest-title').value);
-    fd.append('agent_id',     document.getElementById('ingest-agent').value);
-    fd.append('access_level', document.getElementById('ingest-access').value);
+    fd.append('file',          fi.files[0]);
+    fd.append('title',         document.getElementById('ingest-title').value);
+    fd.append('agent_id',      document.getElementById('ingest-agent').value);
+    fd.append('access_level',  document.getElementById('ingest-access').value);
+    fd.append('enable_docint', useDocInt ? 'true' : 'false');
+
     try {
       const r = await fetch('/api/ingest', { method: 'POST', body: fd });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+
       ok.innerHTML = `✓ <strong>${esc(d.title)}</strong> ingested — ${d.chunks} chunks · ${d.qdrant_points} vectors`;
       ok.style.display = 'block';
+
+      // Render Document Intelligence summary if available
+      if (d.docint) {
+        const di = d.docint;
+        const ents = di.entities || {};
+        const entLines = [
+          ents.dates?.length        && `Dates: ${ents.dates.slice(0,3).map(esc).join(', ')}`,
+          ents.amounts?.length      && `Amounts: ${ents.amounts.slice(0,3).map(esc).join(', ')}`,
+          ents.names?.length        && `Names: ${ents.names.slice(0,3).map(esc).join(', ')}`,
+          ents.organizations?.length && `Orgs: ${ents.organizations.slice(0,3).map(esc).join(', ')}`,
+        ].filter(Boolean).join(' &nbsp;·&nbsp; ');
+
+        diPanel.innerHTML = `
+          <div style="border-top:1px solid var(--border,#2d3a50);padding-top:10px;margin-top:4px">
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+              <span style="background:#1e3a5f;color:#7dd3fc;border-radius:4px;padding:2px 8px;font-size:.72rem;font-weight:600;text-transform:uppercase">${esc(di.document_type)}</span>
+              ${di.document_subtype ? `<span style="background:#1a2535;color:#94a3b8;border-radius:4px;padding:2px 8px;font-size:.72rem">${esc(di.document_subtype)}</span>` : ''}
+              ${di.is_scanned ? '<span style="background:#2a1a1a;color:#f87171;border-radius:4px;padding:2px 8px;font-size:.72rem">OCR / Scanned</span>' : ''}
+              <span style="background:#1a2535;color:#94a3b8;border-radius:4px;padding:2px 8px;font-size:.72rem">${di.pages} page${di.pages !== 1 ? 's' : ''}</span>
+              <span style="background:#1a2535;color:#94a3b8;border-radius:4px;padding:2px 8px;font-size:.72rem">lang: ${esc(di.language)}</span>
+              ${di.tables > 0 ? `<span style="background:#1a2a1a;color:#6ee7b7;border-radius:4px;padding:2px 8px;font-size:.72rem">${di.tables} table${di.tables !== 1 ? 's' : ''}</span>` : ''}
+              ${di.form_fields > 0 ? `<span style="background:#2a2a1a;color:#fbbf24;border-radius:4px;padding:2px 8px;font-size:.72rem">${di.form_fields} form fields</span>` : ''}
+            </div>
+            ${entLines ? `<div style="color:#64748b">${entLines}</div>` : ''}
+          </div>`;
+        diPanel.style.display = 'block';
+      }
+
       showToast(`✓ Ingested "${d.title}" (${d.chunks} chunks)`);
-      setTimeout(() => { closeModal('ingest-modal'); loadCollections(); }, 2200);
+      setTimeout(() => { closeModal('ingest-modal'); loadCollections(); }, useDocInt ? 3500 : 2200);
     } catch (e) { err.textContent = e.message; err.style.display = 'block'; }
     finally { btn.disabled = false; btn.textContent = '↑  Ingest Document'; }
   }
@@ -788,9 +897,22 @@
     finally { btn.disabled = false; btn.textContent = 'Archive & Delete'; }
   }
 
-  // ── Archives list modal ────────────────────────────────────────────────────
+  // ── Archives modal ─────────────────────────────────────────────────────────
+  let _arcTab = 'collections';
+
   async function openArchivesModal() {
     document.getElementById('archives-modal').classList.add('open');
+    await switchArcTab(_arcTab);
+  }
+
+  async function switchArcTab(tab) {
+    _arcTab = tab;
+    document.getElementById('arc-tab-cols').classList.toggle('arc-tab-active', tab === 'collections');
+    document.getElementById('arc-tab-docs').classList.toggle('arc-tab-active', tab === 'documents');
+    tab === 'collections' ? await _loadCollectionArchives() : await _loadDocArchives();
+  }
+
+  async function _loadCollectionArchives() {
     const body = document.getElementById('archives-body');
     body.innerHTML = '<div class="spinner"></div>';
     try {
@@ -799,7 +921,7 @@
       if (!d.archives.length) {
         body.innerHTML = `<div class="empty" style="padding:40px 0">
           <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8l1 12a2 2 0 002 2h8a2 2 0 002-2L19 8"/></svg>
-          <p>No archives yet.<br>Delete a collection to archive it.</p>
+          <p>No collection archives yet.<br>Archive a collection to see it here.</p>
         </div>`;
         return;
       }
@@ -823,6 +945,53 @@
     } catch (e) {
       body.innerHTML = `<p style="color:#f87171;font-size:.85rem">${e.message}</p>`;
     }
+  }
+
+  async function _loadDocArchives() {
+    const body = document.getElementById('archives-body');
+    body.innerHTML = '<div class="spinner"></div>';
+    try {
+      const r = await fetch('/api/doc-archives');
+      const d = await r.json();
+      if (!d.doc_archives.length) {
+        body.innerHTML = `<div class="empty" style="padding:40px 0">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+          <p>No archived documents yet.<br>Remove a document from a collection to archive it here.</p>
+        </div>`;
+        return;
+      }
+      body.innerHTML = d.doc_archives.map(a => `
+        <div class="archive-item" id="darc-row-${esc(a.doc_id)}">
+          <div class="archive-row">
+            <div style="min-width:0">
+              <div class="archive-name">${esc(a.title || a.doc_id)}</div>
+              <div class="archive-meta">
+                ${a.chunk_count} chunk${a.chunk_count !== 1 ? 's' : ''} &nbsp;·&nbsp;
+                from <strong>${esc(a.source_collection)}</strong> &nbsp;·&nbsp;
+                archived ${fmtDate(a.archived_at)}
+              </div>
+            </div>
+            <button class="archive-restore-btn" onclick="restoreDocArchive('${esc(a.doc_id)}','${esc(a.source_collection)}',this)">Restore</button>
+          </div>
+        </div>`).join('');
+    } catch (e) {
+      body.innerHTML = `<p style="color:#f87171;font-size:.85rem">${e.message}</p>`;
+    }
+  }
+
+  async function restoreDocArchive(docId, sourceCollection, btn) {
+    btn.disabled = true; btn.textContent = 'Restoring…';
+    try {
+      const r = await fetch(`/api/doc-archives/${enc(docId)}/restore`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ collection: sourceCollection }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+      const row = document.getElementById(`darc-row-${docId}`);
+      if (row) { row.style.transition = 'opacity .3s'; row.style.opacity = '0'; setTimeout(() => row.remove(), 300); }
+      showToast(`✓ Restored to "${d.collection}" (${d.points_restored} vectors)`);
+    } catch (e) { showToast('✗ ' + e.message); btn.disabled = false; btn.textContent = 'Restore'; }
   }
 
   // ── Restore modal ──────────────────────────────────────────────────────────
