@@ -758,6 +758,8 @@ def last_user_text(messages: list) -> str:
 # ── LLM routing ───────────────────────────────────────────────────────────────
 
 def _resolve_model(model: str) -> tuple:
+    if model == "openclaw":
+        return ANTHROPIC_CHAT_MODEL, "anthropic"
     if model.startswith("claude-"):
         return model, "anthropic"
     if model.startswith(("gpt-", "o1", "o3")):
