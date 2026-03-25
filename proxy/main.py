@@ -383,14 +383,14 @@ _EXPAND_CYPHER = {
         OPTIONAL MATCH (n)-[:DEPENDS_ON*1..2]->(dep)
         OPTIONAL MATCH (n)<-[:HAS_CHUNK]-(doc:Document)
         OPTIONAL MATCH (g:Goal)-[:DEPENDS_ON]->(n)
-        OPTIONAL MATCH (inf:Inference)-[:SUPPORTS]->(n)
-            WHERE inf.confidence >= $min_conf
+        OPTIONAL MATCH (infer_node:Inference)-[:SUPPORTS]->(n)
+            WHERE infer_node.confidence >= $min_conf
         RETURN
             properties(n) AS node, labels(n) AS labels,
             properties(doc) AS document,
-            collect(DISTINCT properties(dep))[..5]   AS dependencies,
-            collect(DISTINCT properties(g))[..5]     AS blocking_goals,
-            collect(DISTINCT properties(inf))[..3]   AS supporting_inferences
+            collect(DISTINCT properties(dep))[..5]       AS dependencies,
+            collect(DISTINCT properties(g))[..5]         AS blocking_goals,
+            collect(DISTINCT properties(infer_node))[..3] AS supporting_inferences
         LIMIT 20
     """,
     "dependency": """
@@ -461,22 +461,22 @@ _EXPAND_CYPHER = {
         OPTIONAL MATCH (n)-[:ABOUT]->(concept:Concept)
         OPTIONAL MATCH (n)-[:CONTRADICTS]-(other:Belief)
             WHERE other.confidence >= $min_conf
-        OPTIONAL MATCH (inf:Inference)-[:SUPPORTS]->(n)
-            WHERE inf.confidence >= $min_conf
-              AND (inf.valid_to IS NULL OR inf.valid_to >= $now)
+        OPTIONAL MATCH (infer_node:Inference)-[:SUPPORTS]->(n)
+            WHERE infer_node.confidence >= $min_conf
+              AND (infer_node.valid_to IS NULL OR infer_node.valid_to >= $now)
         RETURN
             properties(n)   AS node, labels(n) AS labels, null AS document,
             properties(a)   AS agent,
-            collect(DISTINCT properties(concept))[..5] AS concepts,
-            collect(DISTINCT properties(other))[..3]   AS contradictions,
-            collect(DISTINCT properties(inf))[..3]     AS supporting_inferences
+            collect(DISTINCT properties(concept))[..5]       AS concepts,
+            collect(DISTINCT properties(other))[..3]         AS contradictions,
+            collect(DISTINCT properties(infer_node))[..3]    AS supporting_inferences
         LIMIT 20
     """,
 }
 
 _FALLBACK_CYPHER = """
     MATCH (n)
-    WHERE any(k IN keys(n) WHERE toLower(toString(n[k])) CONTAINS toLower($q))
+    WHERE any(k IN keys(n) WHERE NOT valueType(n[k]) STARTS WITH 'LIST' AND toLower(toString(n[k])) CONTAINS toLower($q))
       AND coalesce(n.confidence, 1.0) >= $min_conf
       AND (n.valid_to IS NULL OR n.valid_to >= $now)
     RETURN properties(n) AS node, labels(n) AS labels, null AS document
