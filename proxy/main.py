@@ -759,6 +759,10 @@ def last_user_text(messages: list) -> str:
 
 def _resolve_model(model: str) -> tuple:
     if model == "openclaw":
+        if LLM_BACKEND == "ollama":
+            return OLLAMA_MODEL, "ollama"
+        if LLM_BACKEND == "openai":
+            return OPENAI_CHAT_MODEL, "openai"
         return ANTHROPIC_CHAT_MODEL, "anthropic"
     if model.startswith("claude-"):
         return model, "anthropic"
