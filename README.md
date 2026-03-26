@@ -86,6 +86,16 @@ Required variables:
 | `OPENCLAW_GATEWAY_TOKEN` | Token for OpenClaw gateway authentication |
 | `OPENCLAW_GATEWAY_PASSWORD` | Password for OpenClaw gateway |
 
+Optional OpenClaw gateway overrides:
+
+| Variable | Default | Description |
+|---|---|---|
+| `OPENCLAW_GATEWAY_PORT` | `18789` | Internal gateway port |
+| `OPENCLAW_BRIDGE_PORT` | `18790` | Internal bridge port |
+| `OPENCLAW_GATEWAY_BIND` | `lan` | Network bind mode |
+| `OPENCLAW_CONFIG_DIR` | `openclaw_config` | Config volume path |
+| `OPENCLAW_DOCKER_APT_PACKAGES` | _(empty)_ | Extra apt packages installed at container start |
+
 Optional cognitive knobs:
 
 | Variable | Default | Description |
@@ -118,6 +128,7 @@ eedgeai/
 │   ├── Dockerfile                 ← extends openclaw base image (build context: project root)
 │   ├── entrypoint.sh              ← starts embedded relay then execs openclaw
 │   ├── package.json               ← neo4j-driver, qdrant client, pdf-parse, mammoth
+│   ├── package-lock.json          ← lockfile (committed for reproducible builds)
 │   ├── neo4j.js                   ← neo4j-cli  (shell tool for OpenClaw agent)
 │   ├── qdrant.js                  ← qdrant-cli (shell tool for OpenClaw agent)
 │   └── ingest.js                  ← ingest-cli (document ingestion tool)
@@ -268,9 +279,9 @@ Open **http://localhost:18799**:
 - Full agentic interface with tool use
 - Native access to `neo4j-cli`, `qdrant-cli`, and `ingest-cli` as shell tools
 - Connects to Neo4j and Qdrant via MCP sidecar servers
-- Default model: `anthropic/claude-sonnet-4-6`
+- Model is selected from `LLM_BACKEND` in `.env`: `anthropic` → `claude-sonnet-4-6`, `openai` → `gpt-4o`, `ollama` → `llama3.2`
 
-To change the default model:
+To override the active model at runtime:
 ```bash
 docker exec eedgeai-openclaw-1 openclaw models set anthropic/claude-sonnet-4-6
 # or list all available (authenticated) models:
