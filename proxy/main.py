@@ -393,12 +393,12 @@ async def _qdrant_search_collection(
         "must": [
             # Exclude expired: valid_to must be null or >= now
             {"should": [
-                {"is_null": {"key": "valid_to"}},
+                {"is_empty": {"key": "valid_to"}},
                 {"key": "valid_to", "range": {"gte": now}},
             ]},
             # Exclude not-yet-valid: valid_from must be null or <= now
             {"should": [
-                {"is_null": {"key": "valid_from"}},
+                {"is_empty": {"key": "valid_from"}},
                 {"key": "valid_from", "range": {"lte": now}},
             ]},
         ],
@@ -2169,11 +2169,11 @@ async def api_search(
             temporal_filter = {
                 "must": [
                     {"should": [
-                        {"is_null": {"key": "valid_to"}},
+                        {"is_empty": {"key": "valid_to"}},
                         {"key": "valid_to", "range": {"gte": now}},
                     ]},
                     {"should": [
-                        {"is_null": {"key": "valid_from"}},
+                        {"is_empty": {"key": "valid_from"}},
                         {"key": "valid_from", "range": {"lte": now}},
                     ]},
                 ],
