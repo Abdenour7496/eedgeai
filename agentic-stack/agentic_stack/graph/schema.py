@@ -74,6 +74,7 @@ CONSTRAINTS = [
     "CREATE CONSTRAINT document_id  IF NOT EXISTS FOR (n:Document)  REQUIRE n.id IS UNIQUE",
     "CREATE CONSTRAINT chunk_id     IF NOT EXISTS FOR (n:Chunk)     REQUIRE n.id IS UNIQUE",
     "CREATE CONSTRAINT concept_name IF NOT EXISTS FOR (n:Concept)   REQUIRE n.name IS UNIQUE",
+    "CREATE CONSTRAINT entity_name  IF NOT EXISTS FOR (n:Entity)    REQUIRE n.name IS UNIQUE",
     # Agent world
     "CREATE CONSTRAINT agent_id     IF NOT EXISTS FOR (n:Agent)     REQUIRE n.id IS UNIQUE",
     "CREATE CONSTRAINT goal_id      IF NOT EXISTS FOR (n:Goal)      REQUIRE n.id IS UNIQUE",
@@ -90,6 +91,7 @@ INDEXES = [
     # ── document graph ────────────────────────────────────────────────────────
     "CREATE INDEX chunk_document  IF NOT EXISTS FOR (n:Chunk)  ON (n.document_id)",
     "CREATE INDEX chunk_position  IF NOT EXISTS FOR (n:Chunk)  ON (n.position)",
+    "CREATE INDEX entity_type     IF NOT EXISTS FOR (n:Entity) ON (n.type)",
 
     # ── event / time ──────────────────────────────────────────────────────────
     "CREATE INDEX event_timestamp IF NOT EXISTS FOR (n:Event)  ON (n.timestamp)",

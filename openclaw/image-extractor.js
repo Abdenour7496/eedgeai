@@ -22,7 +22,7 @@
  * --------
  *   OPENAI_API_KEY        required for OpenAI vision
  *   ANTHROPIC_API_KEY     required for Anthropic vision
- *   VISION_BACKEND        openai (default) | anthropic
+ *   VISION_BACKEND        anthropic (default) | openai | ollama
  *   VISION_MODEL          gpt-4o (OpenAI default) | claude-3-5-sonnet-20241022 (Anthropic default)
  *   VISION_MAX_TOKENS     default 1200
  *   VISION_MAX_PX         max pixel dimension before resize, default 1024
@@ -32,20 +32,25 @@
 'use strict';
 
 const https = require('https');
+const http  = require('http');
 const zlib  = require('zlib');
 const path  = require('path');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const VISION_BACKEND   = process.env.VISION_BACKEND   || 'openai';
+const VISION_BACKEND   = process.env.VISION_BACKEND   || 'anthropic';
 const VISION_MAX_TOKENS = parseInt(process.env.VISION_MAX_TOKENS || '1200', 10);
 const VISION_MAX_PX    = parseInt(process.env.VISION_MAX_PX || '1024', 10);
 const NO_VISION        = process.env.NO_VISION === '1';
 const OPENAI_KEY       = process.env.OPENAI_API_KEY   || '';
 const ANTHROPIC_KEY    = process.env.ANTHROPIC_API_KEY || '';
+const OLLAMA_BASE_URL  = process.env.OLLAMA_BASE_URL  || 'http://ollama:11434';
+const OLLAMA_VISION_MODEL = process.env.OLLAMA_VISION_MODEL || 'llava:7b';
 
 const VISION_MODEL = process.env.VISION_MODEL || (
-  VISION_BACKEND === 'anthropic' ? 'claude-3-5-sonnet-20241022' : 'gpt-4o'
+  VISION_BACKEND === 'anthropic' ? 'claude-sonnet-4-20250514'
+    : VISION_BACKEND === 'ollama' ? OLLAMA_VISION_MODEL
+    : 'gpt-4o'
 );
 
 // ── Extension sets ────────────────────────────────────────────────────────────
@@ -112,6 +117,33 @@ function httpsPost(hostname, path_, headers, body) {
   });
 }
 
+// ── HTTP POST helper (for local services like Ollama) ────────────────────────
+
+function httpPost(urlStr, headers, body) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlStr);
+    const bodyBuf = Buffer.from(body);
+    const req = http.request({
+      hostname: url.hostname, port: url.port, path: url.pathname, method: 'POST',
+      headers: { ...headers, 'Content-Length': bodyBuf.length },
+    }, res => {
+      const chunks = [];
+      res.on('data', d => chunks.push(d));
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(Buffer.concat(chunks).toString());
+          if (parsed.error) return reject(new Error(
+            parsed.error.message || JSON.stringify(parsed.error)
+          ));
+          resolve(parsed);
+        } catch (e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.end(bodyBuf);
+  });
+}
+
 // ── Vision API calls ──────────────────────────────────────────────────────────
 
 async function openaiVision(pngBase64, prompt) {
@@ -155,8 +187,27 @@ async function anthropicVision(pngBase64, prompt) {
   return res.content[0].text.trim();
 }
 
+async function ollamaVision(pngBase64, prompt) {
+  const body = JSON.stringify({
+    model: VISION_MODEL,
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url: `data:image/png;base64,${pngBase64}` } },
+        { type: 'text', text: prompt },
+      ],
+    }],
+    max_tokens: VISION_MAX_TOKENS,
+  });
+  const res = await httpPost(`${OLLAMA_BASE_URL}/v1/chat/completions`, {
+    'Content-Type': 'application/json',
+  }, body);
+  return res.choices[0].message.content.trim();
+}
+
 async function callVision(pngBase64, prompt) {
   if (VISION_BACKEND === 'anthropic') return anthropicVision(pngBase64, prompt);
+  if (VISION_BACKEND === 'ollama')    return ollamaVision(pngBase64, prompt);
   return openaiVision(pngBase64, prompt);
 }
 

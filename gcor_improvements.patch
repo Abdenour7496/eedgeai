@@ -1,0 +1,270 @@
+From 383678f1c3f27588887989edba5a36dd9542a547 Mon Sep 17 00:00:00 2001
+From: Buddy AI <buddysaaid@gmail.com>
+Date: Thu, 26 Mar 2026 00:37:06 +0000
+Subject: [PATCH] feat(proxy): embedding intent classification, provenance
+ chain, belief resolution, graph-aware chunking
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Intent classification: upgraded from keyword scan to embedding cosine similarity
+  against precomputed exemplar vectors (startup). Falls back to keyword scan if
+  embeddings unavailable. Also improved dependency keywords.
+- Provenance chain: new build_provenance_chain() traces Chunk→Concept/Entity path
+  in Neo4j and injects 'Retrieval Provenance:' into GCOR context header.
+- Belief conflict resolution: resolve_belief_conflicts() picks winning belief by
+  confidence then valid_from recency; injects resolution reason into context.
+- Graph-aware chunking: _find_entity_boundaries() uses regex to protect person names,
+  acronyms, and ISO dates from being split across chunk boundaries.
+---
+ proxy/main.py | 169 +++++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 161 insertions(+), 8 deletions(-)
+
+diff --git a/proxy/main.py b/proxy/main.py
+index 8f68b8c..55aa769 100644
+--- a/proxy/main.py
++++ b/proxy/main.py
+@@ -184,8 +184,8 @@ AGENT_ID = os.getenv("AGENT_ID", "")
+ _INTENT_KEYWORDS = {
+     "planning":    ["plan", "schedule", "next step", "roadmap", "workflow",
+                     "milestone", "sprint", "agenda", "timeline", "sequence"],
+-    "dependency":  ["depends", "requires", "blocked", "prerequisite", "constraint",
+-                    "before", "needs", "relies on", "linked to", "after"],
++    "dependency":  ["depends", "depend on", "requires", "blocked", "prerequisite", "constraint",
++                    "relies on", "linked to", "what does", "what do"],
+     "memory":      ["remember", "recall", "history", "last time", "previously",
+                     "past", "earlier", "before we", "you said", "i told"],
+     "factual":     ["what is", "how does", "why", "explain", "define", "describe",
+@@ -198,8 +198,64 @@ _INTENT_KEYWORDS = {
+                     "my view", "i think"],
+ }
+
++# ── Embedding-based intent classification ─────────────────────────────────────
+
+-def classify_intent(query: str) -> str:
++_INTENT_EXEMPLARS = {
++    "factual":    "What is this? How does it work? Explain and define the concept.",
++    "planning":   "What are the next steps? Create a roadmap and schedule milestones.",
++    "dependency": "What does this depend on? What blocks progress? What are prerequisites?",
++    "memory":     "What did we discuss before? Recall our previous conversation history.",
++    "inference":  "What can we conclude? Derive the logical implication from this evidence.",
++    "belief":     "What do you think? What is your opinion? What do you believe is likely?",
++    "semantic":   "Search for relevant information about this topic.",
++}
++
++_INTENT_EXEMPLAR_VECS: dict = {}
++
++
++def _cosine_sim(a: list, b: list) -> float:
++    """Cosine similarity between two equal-length vectors."""
++    if not a or not b or len(a) != len(b):
++        return 0.0
++    dot = sum(x * y for x, y in zip(a, b))
++    norm_a = sum(x * x for x in a) ** 0.5
++    norm_b = sum(x * x for x in b) ** 0.5
++    if norm_a == 0 or norm_b == 0:
++        return 0.0
++    return dot / (norm_a * norm_b)
++
++
++@app.on_event("startup")
++async def _precompute_intent_exemplars():
++    """Embed intent exemplars at startup for embedding-based classification."""
++    global _INTENT_EXEMPLAR_VECS
++    try:
++        for intent, sentence in _INTENT_EXEMPLARS.items():
++            vec = await embed_text(sentence)
++            if vec:
++                _INTENT_EXEMPLAR_VECS[intent] = vec
++        logger.info("Intent exemplar embeddings precomputed: %d intents", len(_INTENT_EXEMPLAR_VECS))
++    except Exception as exc:
++        logger.warning("Could not precompute intent exemplars (will use keyword fallback): %s", exc)
++
++
++async def classify_intent(query: str) -> str:
++    """Classify query intent via embedding cosine sim; falls back to keyword scan."""
++    # Embedding-based path
++    if _INTENT_EXEMPLAR_VECS:
++        try:
++            query_vec = await embed_text(query)
++            if query_vec:
++                scores = {
++                    intent: _cosine_sim(query_vec, vec)
++                    for intent, vec in _INTENT_EXEMPLAR_VECS.items()
++                }
++                best = max(scores, key=scores.get)
++                logger.debug("Intent scores: %s → %s", scores, best)
++                return best
++        except Exception as exc:
++            logger.warning("Embedding intent classification failed, using keyword fallback: %s", exc)
++    # Keyword fallback
+     q = query.lower()
+     for intent, keywords in _INTENT_KEYWORDS.items():
+         if any(kw in q for kw in keywords):
+@@ -516,6 +572,43 @@ async def neo4j_expand(
+         return []
+
+
++# ── Step 2c: Retrieval Provenance Chain ───────────────────────────────────────
++
++async def build_provenance_chain(element_ids: list) -> str:
++    """
++    Trace the retrieval path: Chunk → Concept/Entity/Inference in Neo4j.
++    Returns a human-readable provenance string, or "" if nothing found.
++    """
++    if not element_ids:
++        return ""
++    try:
++        driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
++        try:
++            async with driver.session(database=NEO4J_DATABASE) as session:
++                result = await session.run(
++                    """
++                    MATCH path = (c:Chunk)-[:MENTIONS*0..2]->(n)
++                    WHERE elementId(c) IN $ids
++                    RETURN [node IN nodes(path) |
++                        labels(node)[0] + ': ' +
++                        coalesce(node.text, node.name, node.title, '?')
++                    ] AS chain
++                    LIMIT 5
++                    """,
++                    ids=element_ids,
++                )
++                rows = await result.data()
++        finally:
++            await driver.close()
++        if not rows:
++            return ""
++        chains = [" → ".join(r["chain"][:80] if isinstance(r["chain"], list) else [str(r["chain"])]) for r in rows[:3]]
++        return " | ".join(c for c in chains if c)
++    except Exception as exc:
++        logger.debug("Provenance chain query failed: %s", exc)
++        return ""
++
++
+ # ── Step 3: Reflection ─────────────────────────────────────────────────────────
+
+ def _reflection_fallback(qdrant_hits: list, graph_records: list) -> list:
+@@ -568,7 +661,36 @@ def _temporal_badge(props: dict) -> str:
+     return f"  [valid {', '.join(parts)}]" if parts else ""
+
+
+-def build_gcor_context(intent: str, qdrant_hits: list, graph_records: list) -> str:
++def resolve_belief_conflicts(records: list) -> list:
++    """
++    For records with belief contradictions, pick the winning belief by:
++    1. Highest confidence
++    2. Most recent valid_from as tiebreaker
++    Sets _resolved_belief and _resolution_reason on each conflicting record.
++    """
++    for rec in records:
++        contradictions = [c for c in (rec.get("contradictions") or []) if c]
++        if not contradictions:
++            continue
++        node = rec.get("node", {})
++        candidates = [node] + contradictions
++        def _sort_key(b):
++            conf = float(b.get("confidence") or 0)
++            vf   = str(b.get("valid_from") or "")
++            return (conf, vf)
++        winner = max(candidates, key=_sort_key)
++        conf_pct = int(float(winner.get("confidence") or 0) * 100)
++        vf = str(winner.get("valid_from") or "")[:10]
++        rec["_resolved_belief"] = winner
++        rec["_resolution_reason"] = (
++            f"Selected belief with confidence={conf_pct}%"
++            + (f", valid_from={vf}" if vf else "")
++            + f" (resolved from {len(candidates)} candidates)"
++        )
++    return records
++
++
++def build_gcor_context(intent: str, qdrant_hits: list, graph_records: list, provenance: str = "") -> str:
+     records = _reflection_fallback(qdrant_hits, graph_records)
+     if not records:
+         return ""
+@@ -586,8 +708,10 @@ def build_gcor_context(intent: str, qdrant_hits: list, graph_records: list) -> s
+         + "]",
+         "",
+         "Neo4j is the primary source of truth. Qdrant identified the entry points.",
+-        "",
+     ]
++    if provenance:
++        lines += ["", f"**Retrieval Provenance:** {provenance}"]
++    lines.append("")
+
+     for rec in records:
+         node   = rec.get("node") or {}
+@@ -695,6 +819,8 @@ def build_gcor_context(intent: str, qdrant_hits: list, graph_records: list) -> s
+             agent = rec.get("agent") or {}
+             if agent.get("id"):
+                 lines.append(f"Held by agent: {agent['id']}")
++            if rec.get("_resolution_reason"):
++                lines.append(f"⚖️ Conflict resolution: {rec['_resolution_reason']}")
+
+         elif intent == "semantic":
+             concepts = [c for c in (rec.get("concepts") or []) if c]
+@@ -1002,7 +1128,7 @@ async def chat_completions(request: Request):
+
+         if query:
+             # ── Step 1: Intent ──────────────────────────────────────────────
+-            intent     = classify_intent(query)
++            intent     = await classify_intent(query)
+             rag_intent = intent
+             logger.info("GCOR intent: %s", intent)
+
+@@ -1026,8 +1152,16 @@ async def chat_completions(request: Request):
+             METRIC_NEO4J_RECORDS.observe(len(graph_records))
+             logger.info("Neo4j: %d graph records expanded", len(graph_records))
+
++            # ── Step 2c: Belief conflict resolution ─────────────────────────
++            graph_records = resolve_belief_conflicts(graph_records)
++
++            # ── Step 2d: Provenance chain ────────────────────────────────────
++            provenance = await build_provenance_chain(element_ids)
++            if provenance:
++                logger.info("Provenance chain: %s", provenance[:120])
++
+             # ── Step 3: Reflection + context build ──────────────────────────
+-            context  = build_gcor_context(intent, qdrant_hits, graph_records)
++            context  = build_gcor_context(intent, qdrant_hits, graph_records, provenance=provenance)
+
+             # Determine fallback mode for metrics
+             if graph_records:
+@@ -2386,14 +2520,33 @@ def _extract_text(filename: str, data: bytes) -> str:
+     return data.decode("utf-8", errors="replace")
+
+
++import re as _re
++
++_ENTITY_PATTERNS = [
++    r'\b[A-Z][a-z]+ [A-Z][a-z]+(?:\s[A-Z][a-z]+)?\b',  # Person/place names (Title Case)
++    r'\b[A-Z]{2,}\b',                                      # Acronyms (e.g. AIOps, GCOR, AWS)
++    r'\b\d{4}-\d{2}-\d{2}\b',                             # ISO dates (2026-03-25)
++]
++
++
++def _find_entity_boundaries(text: str) -> set:
++    """Return character positions that are mid-entity — avoid splitting here."""
++    bad: set = set()
++    for pattern in _ENTITY_PATTERNS:
++        for m in _re.finditer(pattern, text):
++            bad.update(range(m.start(), m.end()))
++    return bad
++
++
+ def _chunk_text(text: str, size: int = 2000, overlap: int = 200) -> list[str]:
++    bad_positions = _find_entity_boundaries(text)
+     chunks, start = [], 0
+     while start < len(text):
+         end = min(start + size, len(text))
+         if end < len(text):
+             for sep in ("\n\n", "\n", " "):
+                 pos = text.rfind(sep, start + size // 2, end)
+-                if pos != -1:
++                if pos != -1 and pos not in bad_positions:
+                     end = pos
+                     break
+         chunk = text[start:end].strip()
+--
+2.39.5

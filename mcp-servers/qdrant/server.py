@@ -72,8 +72,13 @@ from qdrant_client.models import (
 QDRANT_URL      = os.getenv("QDRANT_URL",        "http://qdrant:6333")
 QDRANT_API_KEY  = os.getenv("QDRANT_API_KEY",    "")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME",   "documents")
-OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY",    "")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL",   "text-embedding-3-small")
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY",     "")
+EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "https://api.openai.com")
+EMBEDDING_API_KEY  = os.getenv("EMBEDDING_API_KEY",  "") or OPENAI_API_KEY
+EMBEDDING_MODEL    = os.getenv("EMBEDDING_MODEL",    "text-embedding-3-small")
+EMBEDDING_BACKEND  = os.getenv("EMBEDDING_BACKEND",  "openai")   # openai | ollama
+OLLAMA_BASE_URL    = os.getenv("OLLAMA_BASE_URL",    "http://ollama:11434")
+OLLAMA_EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
 MAX_RETRY       = int(os.getenv("QDRANT_MAX_RETRIES", "3"))
 
 NEO4J_URI      = os.getenv("NEO4J_URI",      "bolt://neo4j:7687")
@@ -114,13 +119,26 @@ async def with_retry(coro_fn, retries: int = MAX_RETRY):
 
 # ── Embedding ──────────────────────────────────────────────────────────────────
 async def embed_texts(texts: list[str]) -> list[list[float]]:
-    if not OPENAI_API_KEY:
-        raise ValueError("OPENAI_API_KEY is not set — cannot embed text")
+    """Embed texts via the configured backend (Ollama or OpenAI)."""
+    truncated = [t[:8000] for t in texts]
+    if EMBEDDING_BACKEND == "ollama":
+        async with httpx.AsyncClient(timeout=120) as c:
+            resp = await c.post(
+                f"{OLLAMA_BASE_URL}/v1/embeddings",
+                json={"input": truncated, "model": OLLAMA_EMBEDDING_MODEL},
+            )
+            resp.raise_for_status()
+        items = resp.json()["data"]
+        items.sort(key=lambda x: x["index"])
+        return [d["embedding"] for d in items]
+    if not EMBEDDING_API_KEY:
+        raise ValueError("EMBEDDING_API_KEY is not set — cannot embed text")
+    url = EMBEDDING_BASE_URL.rstrip("/") + "/v1/embeddings"
     async with httpx.AsyncClient(timeout=60) as c:
         resp = await c.post(
-            "https://api.openai.com/v1/embeddings",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            json={"input": [t[:8000] for t in texts], "model": EMBEDDING_MODEL},
+            url,
+            headers={"Authorization": f"Bearer {EMBEDDING_API_KEY}"},
+            json={"input": truncated, "model": EMBEDDING_MODEL},
         )
         resp.raise_for_status()
         return [d["embedding"] for d in resp.json()["data"]]
@@ -642,8 +660,8 @@ async def sync_neo4j_to_qdrant(
         node_types: Comma-separated node type labels (default "Chunk").
         limit:      Maximum nodes to sync per label (default 500).
     """
-    if not OPENAI_API_KEY:
-        return json.dumps({"error": "OPENAI_API_KEY not set — cannot embed"})
+    if not EMBEDDING_API_KEY:
+        return json.dumps({"error": "EMBEDDING_API_KEY not set — cannot embed"})
 
     try:
         from neo4j import AsyncGraphDatabase

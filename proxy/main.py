@@ -62,7 +62,7 @@ import uuid
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from neo4j import AsyncGraphDatabase
 from prometheus_client import Counter, Histogram
@@ -145,7 +145,11 @@ OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
 OPENAI_CHAT_MODEL    = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")
 ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_CHAT_MODEL = os.getenv("ANTHROPIC_CHAT_MODEL", "claude-sonnet-4-6")
-LLM_BACKEND          = os.getenv("LLM_BACKEND", "openai")   # openai | anthropic | ollama
+LLM_BACKEND          = os.getenv("LLM_BACKEND", "openai")   # openai | anthropic | ollama | openclaw
+
+# ── OpenClaw ────────────────────────────────────────────────────────────────────
+OPENCLAW_BASE_URL      = os.getenv("OPENCLAW_BASE_URL",      "http://openclaw:18799/v1")
+OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
 
 # ── Ollama ─────────────────────────────────────────────────────────────────────
 OLLAMA_BASE_URL        = os.getenv("OLLAMA_BASE_URL",        "http://ollama:11434")
@@ -165,6 +169,19 @@ LLM_RETRY_BASE    = float(os.getenv("LLM_RETRY_BASE",  "1.0"))   # base delay fo
 QDRANT_URL        = os.getenv("QDRANT_URL",        "http://qdrant:6333")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "documents")
 QDRANT_TOP_K      = int(os.getenv("QDRANT_TOP_K",  "8"))
+
+# Cached embedding dimension — probed once at first use
+_embed_dim_cache: int | None = None
+
+
+async def _get_embed_dim() -> int:
+    """Return the vector dimension of the current embedding model (cached)."""
+    global _embed_dim_cache
+    if _embed_dim_cache is not None:
+        return _embed_dim_cache
+    vec = await embed_text("dimension probe")
+    _embed_dim_cache = len(vec) if vec else 768
+    return _embed_dim_cache
 
 # ── Neo4j (cognitive backbone) ────────────────────────────────────────────────
 NEO4J_URI      = os.getenv("NEO4J_URI",      "bolt://neo4j:7687")
@@ -363,22 +380,116 @@ async def embed_text(text: str) -> list | None:
         return None
 
 
-async def qdrant_search(vector: list) -> list:
-    """Return top-K Qdrant hits; each hit includes the full payload."""
+async def _qdrant_search_collection(
+    client: httpx.AsyncClient, collection: str, vector: list, limit: int,
+) -> list:
+    """Search a single Qdrant collection with server-side temporal filters.
+
+    Qdrant pre-filters out expired (valid_to < now) and not-yet-valid
+    (valid_from > now) points so they never consume top-K slots.
+    """
+    now = _now_iso()
+    payload_filter = {
+        "must": [
+            # Exclude expired: valid_to must be null or >= now
+            {"should": [
+                {"is_null": {"key": "valid_to"}},
+                {"key": "valid_to", "range": {"gte": now}},
+            ]},
+            # Exclude not-yet-valid: valid_from must be null or <= now
+            {"should": [
+                {"is_null": {"key": "valid_from"}},
+                {"key": "valid_from", "range": {"lte": now}},
+            ]},
+        ],
+    }
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            resp = await c.post(
-                f"{QDRANT_URL}/collections/{QDRANT_COLLECTION}/points/search",
-                json={"vector": vector, "limit": QDRANT_TOP_K, "with_payload": True},
-            )
-            if resp.status_code == 404:
-                logger.info("Qdrant collection '%s' not found.", QDRANT_COLLECTION)
-                return []
-            resp.raise_for_status()
-            return resp.json().get("result", [])
+        resp = await client.post(
+            f"{QDRANT_URL}/collections/{collection}/points/search",
+            json={
+                "vector": vector,
+                "limit": limit,
+                "with_payload": True,
+                "filter": payload_filter,
+            },
+        )
+        if resp.status_code == 404:
+            return []
+        resp.raise_for_status()
+        hits = resp.json().get("result", [])
+        for h in hits:
+            h.setdefault("_collection", collection)
+        return hits
     except Exception as exc:
-        logger.warning("Qdrant search failed: %s", exc)
+        logger.warning("Qdrant search on '%s' failed: %s", collection, exc)
         return []
+
+
+# Collections to search during RAG (in addition to QDRANT_COLLECTION).
+# Only collections whose dimension matches the active embedding model are queried.
+RAG_EXTRA_COLLECTIONS = [
+    c.strip()
+    for c in os.getenv("RAG_EXTRA_COLLECTIONS", "buddy_memory").split(",")
+    if c.strip()
+]
+
+
+async def qdrant_search(vector: list) -> list:
+    """Search primary + extra RAG collections, fuse by normalised cosine score.
+
+    Each collection's scores are min-max normalised to [0, 1] before merging
+    so that differences in corpus size or score distributions don't bias results.
+    The top QDRANT_TOP_K results across all collections are returned.
+    """
+    embed_dim = len(vector)
+    collections = [QDRANT_COLLECTION]
+
+    # Discover which extra collections have matching dimensions
+    async with httpx.AsyncClient(timeout=10) as c:
+        for name in RAG_EXTRA_COLLECTIONS:
+            if name == QDRANT_COLLECTION:
+                continue
+            try:
+                info = await c.get(f"{QDRANT_URL}/collections/{name}")
+                if info.status_code != 200:
+                    continue
+                col_dim = (info.json().get("result", {})
+                           .get("config", {}).get("params", {})
+                           .get("vectors", {}).get("size"))
+                if col_dim == embed_dim:
+                    collections.append(name)
+                else:
+                    logger.debug(
+                        "Skipping collection '%s': dim %s != embed dim %s",
+                        name, col_dim, embed_dim,
+                    )
+            except Exception:
+                pass
+
+        # Search all matching collections concurrently
+        per_col = max(QDRANT_TOP_K, 12)  # fetch extra so normalisation is stable
+        tasks = [
+            _qdrant_search_collection(c, col, vector, per_col)
+            for col in collections
+        ]
+        results = await asyncio.gather(*tasks)
+
+    # Min-max normalise scores per collection then merge
+    all_hits: list = []
+    for hits in results:
+        if not hits:
+            continue
+        scores = [h.get("score", 0) for h in hits]
+        lo, hi = min(scores), max(scores)
+        span = hi - lo if hi > lo else 1.0
+        for h in hits:
+            h["_raw_score"] = h.get("score", 0)
+            h["score"] = (h["_raw_score"] - lo) / span
+        all_hits.extend(hits)
+
+    # Sort by normalised score descending, take top-K
+    all_hits.sort(key=lambda h: h["score"], reverse=True)
+    return all_hits[:QDRANT_TOP_K]
 
 
 def _filter_hits(hits: list) -> list:
@@ -405,6 +516,10 @@ def _filter_hits(hits: list) -> list:
         if valid_to and valid_to < now:
             logger.debug("Dropping hit %s: expired valid_to %s", h.get("id"), valid_to)
             continue
+        valid_from = p.get("valid_from")
+        if valid_from and valid_from > now:
+            logger.debug("Dropping hit %s: not yet valid (valid_from %s)", h.get("id"), valid_from)
+            continue
 
         # ── access control ────────────────────────────────────────────────────
         access_level = p.get("access_level", "public")
@@ -426,8 +541,11 @@ def _filter_hits(hits: list) -> list:
 _EXPAND_CYPHER = {
     "factual": """
         MATCH (n) WHERE elementId(n) IN $ids
+          AND (n.valid_from IS NULL OR n.valid_from <= $now)
+          AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
         OPTIONAL MATCH (n)-[r]-(related)
-        OPTIONAL MATCH (n)<-[:HAS_CHUNK]-(doc:Document)
+          WHERE (related.valid_to IS NULL OR related.valid_to >= $now)
+        OPTIONAL MATCH (n)<-[:CONTAINS]-(doc:Document)
         RETURN
             properties(n) AS node, labels(n) AS labels,
             properties(doc) AS document,
@@ -438,11 +556,15 @@ _EXPAND_CYPHER = {
     """,
     "planning": """
         MATCH (n) WHERE elementId(n) IN $ids
+          AND (n.valid_from IS NULL OR n.valid_from <= $now)
+          AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
         OPTIONAL MATCH (n)-[:DEPENDS_ON*1..2]->(dep)
-        OPTIONAL MATCH (n)<-[:HAS_CHUNK]-(doc:Document)
+        OPTIONAL MATCH (n)<-[:CONTAINS]-(doc:Document)
         OPTIONAL MATCH (g:Goal)-[:DEPENDS_ON]->(n)
+            WHERE (g.valid_to IS NULL OR g.valid_to >= $now)
         OPTIONAL MATCH (infer_node:Inference)-[:SUPPORTS]->(n)
             WHERE infer_node.confidence >= $min_conf
+              AND (infer_node.valid_to IS NULL OR infer_node.valid_to >= $now)
         RETURN
             properties(n) AS node, labels(n) AS labels,
             properties(doc) AS document,
@@ -453,8 +575,10 @@ _EXPAND_CYPHER = {
     """,
     "dependency": """
         MATCH (n) WHERE elementId(n) IN $ids
+          AND (n.valid_from IS NULL OR n.valid_from <= $now)
+          AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
         OPTIONAL MATCH path = (n)-[:DEPENDS_ON*1..3]->(dep)
-        OPTIONAL MATCH (n)<-[:HAS_CHUNK]-(doc:Document)
+        OPTIONAL MATCH (n)<-[:CONTAINS]-(doc:Document)
         RETURN
             properties(n)  AS node, labels(n) AS labels,
             properties(doc) AS document,
@@ -463,21 +587,25 @@ _EXPAND_CYPHER = {
     """,
     "memory": """
         MATCH (n) WHERE elementId(n) IN $ids
-        OPTIONAL MATCH (n)-[:MENTIONS]->(concept:Concept)
-        OPTIONAL MATCH (mem:Memory)-[:ABOUT]->(concept)
+          AND (n.valid_from IS NULL OR n.valid_from <= $now)
+          AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
+        OPTIONAL MATCH (n)-[:MENTIONS]->(entity:Entity)
+        OPTIONAL MATCH (mem:Memory)-[:ABOUT]->(entity)
             WHERE ($agent_id = '' OR mem.agent_id = $agent_id)
               AND mem.confidence >= $min_conf
-              AND (mem.valid_to IS NULL OR mem.valid_to >= $now)
-        OPTIONAL MATCH (bel:Belief)-[:ABOUT]->(concept)
+              AND (mem.valid_from IS NULL OR mem.valid_from <= $now)
+              AND (mem.valid_to   IS NULL OR mem.valid_to   >= $now)
+        OPTIONAL MATCH (bel:Belief)-[:ABOUT]->(entity)
             WHERE ($agent_id = '' OR bel.agent_id = $agent_id)
               AND bel.confidence >= $min_conf
-              AND (bel.valid_to IS NULL OR bel.valid_to >= $now)
-        OPTIONAL MATCH (evt:Event)-[:INVOLVES]->(concept)
-        OPTIONAL MATCH (n)<-[:HAS_CHUNK]-(doc:Document)
+              AND (bel.valid_from IS NULL OR bel.valid_from <= $now)
+              AND (bel.valid_to   IS NULL OR bel.valid_to   >= $now)
+        OPTIONAL MATCH (evt:Event)-[:INVOLVES]->(entity)
+        OPTIONAL MATCH (n)<-[:CONTAINS]-(doc:Document)
         RETURN
             properties(n)   AS node, labels(n) AS labels,
             properties(doc) AS document,
-            collect(DISTINCT properties(concept))[..5] AS concepts,
+            collect(DISTINCT properties(entity))[..5] AS concepts,
             collect(DISTINCT properties(mem))[..5]     AS memories,
             collect(DISTINCT properties(bel))[..3]     AS beliefs,
             collect(DISTINCT properties(evt))[..5]     AS events
@@ -486,25 +614,31 @@ _EXPAND_CYPHER = {
     """,
     "semantic": """
         MATCH (n) WHERE elementId(n) IN $ids
-        OPTIONAL MATCH (n)-[:MENTIONS]->(concept:Concept)
-        OPTIONAL MATCH (n)-[:FOLLOWS]-(neighbor:Chunk)
-        OPTIONAL MATCH (n)<-[:HAS_CHUNK]-(doc:Document)
+          AND (n.valid_from IS NULL OR n.valid_from <= $now)
+          AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
+        OPTIONAL MATCH (n)-[:MENTIONS]->(entity:Entity)
+        OPTIONAL MATCH (n)-[:NEXT]-(neighbor:Chunk)
+          WHERE (neighbor.valid_to IS NULL OR neighbor.valid_to >= $now)
+        OPTIONAL MATCH (n)<-[:CONTAINS]-(doc:Document)
         RETURN
             properties(n)   AS node, labels(n) AS labels,
             properties(doc) AS document,
-            collect(DISTINCT properties(concept))[..5]  AS concepts,
+            collect(DISTINCT properties(entity))[..5]  AS concepts,
             collect(DISTINCT properties(neighbor))[..3] AS neighbors
         LIMIT 20
     """,
     "inference": """
         MATCH (n) WHERE elementId(n) IN $ids
+          AND (n.valid_from IS NULL OR n.valid_from <= $now)
+          AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
         OPTIONAL MATCH (n)-[:DERIVED_FROM]->(src)
         OPTIONAL MATCH (n)-[:SUPPORTS]->(tgt)
-        OPTIONAL MATCH (n)<-[:HAS_CHUNK]-(doc:Document)
+        OPTIONAL MATCH (n)<-[:CONTAINS]-(doc:Document)
         OPTIONAL MATCH (downstream:Inference)-[:DERIVED_FROM]->(n)
             WHERE downstream.confidence >= $min_conf
               AND ($agent_id = '' OR downstream.agent_id = $agent_id)
-              AND (downstream.valid_to IS NULL OR downstream.valid_to >= $now)
+              AND (downstream.valid_from IS NULL OR downstream.valid_from <= $now)
+              AND (downstream.valid_to   IS NULL OR downstream.valid_to   >= $now)
         RETURN
             properties(n)   AS node, labels(n) AS labels,
             properties(doc) AS document,
@@ -515,17 +649,21 @@ _EXPAND_CYPHER = {
     """,
     "belief": """
         MATCH (n) WHERE elementId(n) IN $ids
+          AND (n.valid_from IS NULL OR n.valid_from <= $now)
+          AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
         OPTIONAL MATCH (a:Agent)-[:HOLDS]->(n)
-        OPTIONAL MATCH (n)-[:ABOUT]->(concept:Concept)
+        OPTIONAL MATCH (n)-[:ABOUT]->(entity:Entity)
         OPTIONAL MATCH (n)-[:CONTRADICTS]-(other:Belief)
             WHERE other.confidence >= $min_conf
+              AND (other.valid_to IS NULL OR other.valid_to >= $now)
         OPTIONAL MATCH (infer_node:Inference)-[:SUPPORTS]->(n)
             WHERE infer_node.confidence >= $min_conf
-              AND (infer_node.valid_to IS NULL OR infer_node.valid_to >= $now)
+              AND (infer_node.valid_from IS NULL OR infer_node.valid_from <= $now)
+              AND (infer_node.valid_to   IS NULL OR infer_node.valid_to   >= $now)
         RETURN
             properties(n)   AS node, labels(n) AS labels, null AS document,
             properties(a)   AS agent,
-            collect(DISTINCT properties(concept))[..5]       AS concepts,
+            collect(DISTINCT properties(entity))[..5]       AS concepts,
             collect(DISTINCT properties(other))[..3]         AS contradictions,
             collect(DISTINCT properties(infer_node))[..3]    AS supporting_inferences
         LIMIT 20
@@ -536,7 +674,8 @@ _FALLBACK_CYPHER = """
     MATCH (n)
     WHERE any(k IN keys(n) WHERE NOT valueType(n[k]) STARTS WITH 'LIST' AND toLower(toString(n[k])) CONTAINS toLower($q))
       AND coalesce(n.confidence, 1.0) >= $min_conf
-      AND (n.valid_to IS NULL OR n.valid_to >= $now)
+      AND (n.valid_from IS NULL OR n.valid_from <= $now)
+      AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
     RETURN properties(n) AS node, labels(n) AS labels, null AS document
     LIMIT 10
 """
@@ -653,14 +792,32 @@ def _confidence_badge(props: dict) -> str:
 
 
 def _temporal_badge(props: dict) -> str:
+    now = _now_iso()[:10]
     parts = []
     vf = props.get("valid_from")
     vt = props.get("valid_to")
     if vf:
-        parts.append(f"from {vf[:10]}")
+        vf_short = vf[:10]
+        parts.append(f"from {vf_short}")
+        # Add staleness hint for old knowledge
+        try:
+            from datetime import datetime, timezone
+            age_days = (datetime.now(timezone.utc) - datetime.fromisoformat(vf)).days
+            if age_days > 365:
+                parts.append(f"⚠ {age_days // 365}y old")
+            elif age_days > 90:
+                parts.append(f"⚠ {age_days}d old")
+        except Exception:
+            pass
     if vt:
-        parts.append(f"to {vt[:10]}")
-    return f"  [valid {', '.join(parts)}]" if parts else ""
+        vt_short = vt[:10]
+        parts.append(f"expires {vt_short}")
+        # Warn if expiring soon
+        if vt_short <= now:
+            parts.append("EXPIRED")
+        elif vt[:10] <= (now[:8] + str(int(now[8:10]) + 7).zfill(2))[:10]:
+            parts.append("expiring soon")
+    return f"  [{', '.join(parts)}]" if parts else ""
 
 
 def resolve_belief_conflicts(records: list) -> list:
@@ -703,13 +860,17 @@ def build_gcor_context(intent: str, qdrant_hits: list, graph_records: list, prov
     )
     agent_note = f"agent partition: {AGENT_ID} " if AGENT_ID else ""
 
+    now = _now_iso()
     lines = [
         f"## Retrieved Context  [intent: {intent} | "
         f"{len(qdrant_hits)} semantic candidates → {len(records)} graph records"
         + (f" | {confidence_note}{agent_note}".rstrip() if (confidence_note or agent_note) else "")
         + "]",
         "",
-        "Neo4j is the primary source of truth. Qdrant identified the entry points.",
+        f"Current time: {now[:19]}Z. "
+        "Neo4j is the primary source of truth. Qdrant identified the entry points. "
+        "All results have been temporally filtered — only currently valid knowledge "
+        "is shown. Prefer more recent sources when information conflicts.",
     ]
     if provenance:
         lines += ["", f"**Retrieval Provenance:** {provenance}"]
@@ -887,6 +1048,8 @@ def last_user_text(messages: list) -> str:
 
 def _resolve_model(model: str) -> tuple:
     if model == "openclaw":
+        if LLM_BACKEND == "openclaw":
+            return "openclaw", "openclaw"
         if LLM_BACKEND == "ollama":
             return OLLAMA_MODEL, "ollama"
         if LLM_BACKEND == "openai":
@@ -896,6 +1059,8 @@ def _resolve_model(model: str) -> tuple:
         return model, "anthropic"
     if model.startswith(("gpt-", "o1", "o3")):
         return model, "openai"
+    if LLM_BACKEND == "openclaw":
+        return "openclaw", "openclaw"
     if LLM_BACKEND == "anthropic":
         return ANTHROPIC_CHAT_MODEL, "anthropic"
     if LLM_BACKEND == "ollama":
@@ -938,6 +1103,45 @@ async def call_ollama(body: dict):
             return JSONResponse(content=resp.json(), status_code=resp.status_code)
         except Exception:
             METRIC_LLM_REQUESTS.labels(backend="ollama", status="error").inc()
+            raise
+
+
+async def call_openclaw(body: dict):
+    """Forward chat completions to the openclaw gateway OpenAI-compatible endpoint."""
+    url = f"{OPENCLAW_BASE_URL}/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}", "Content-Type": "application/json"}
+    body = {**body, "model": body.get("model", "default")}
+    if body.get("stream"):
+        async def stream():
+            try:
+                METRIC_LLM_REQUESTS.labels(backend="openclaw", status="started").inc()
+                async with httpx.AsyncClient(timeout=300) as c:
+                    async with c.stream("POST", url, json=body, headers=headers) as resp:
+                        if resp.status_code != 200:
+                            err = await resp.aread()
+                            logger.error("OpenClaw %s: %s", resp.status_code, err[:200])
+                            METRIC_LLM_REQUESTS.labels(backend="openclaw", status="error").inc()
+                            yield f'data: {{"error": "OpenClaw {resp.status_code}"}}\n\n'.encode()
+                            return
+                        METRIC_LLM_REQUESTS.labels(backend="openclaw", status="success").inc()
+                        async for chunk in resp.aiter_bytes():
+                            yield chunk
+            except Exception as exc:
+                logger.error("OpenClaw stream error: %s", exc)
+                METRIC_LLM_REQUESTS.labels(backend="openclaw", status="exception").inc()
+                yield b'data: {"error": "proxy error"}\n\n'
+        return StreamingResponse(stream(), media_type="text/event-stream")
+    else:
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=300) as c:
+                resp = await c.post(url, json=body, headers=headers)
+                resp.raise_for_status()
+            METRIC_LLM_REQUESTS.labels(backend="openclaw", status="success").inc()
+            METRIC_LLM_DURATION.labels(backend="openclaw").observe(time.monotonic() - t0)
+            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+        except Exception:
+            METRIC_LLM_REQUESTS.labels(backend="openclaw", status="error").inc()
             raise
 
 
@@ -1257,7 +1461,9 @@ async def chat_completions(request: Request):
     model, backend = _resolve_model(body.get("model", "openclaw"))
     body = {**body, "model": model}
     try:
-        if backend == "ollama":
+        if backend == "openclaw":
+            return await call_openclaw(body)
+        elif backend == "ollama":
             return await call_ollama(body)
         elif backend == "anthropic" and ANTHROPIC_API_KEY:
             return await call_anthropic(body)
@@ -1283,6 +1489,15 @@ _TEMPLATES = os.path.join(os.path.dirname(__file__), "templates")
 @app.get("/", response_class=RedirectResponse, status_code=302)
 async def root():
     return "/knowledge"
+
+
+@app.get("/openclaw", response_class=RedirectResponse, status_code=302)
+async def openclaw_redirect():
+    token = OPENCLAW_GATEWAY_TOKEN
+    base  = "http://127.0.0.1:18799"
+    if token:
+        return f"{base}/#token={token}"
+    return base
 
 
 @app.get("/knowledge", response_class=HTMLResponse)
@@ -1398,7 +1613,8 @@ async def api_archive_document(name: str, doc_id: str):
 
         vec_params = (chk.json().get("result", {})
                       .get("config", {}).get("params", {}).get("vectors", {}))
-        vec_size = vec_params.get("size", 1536) if isinstance(vec_params, dict) else 1536
+        vec_size = vec_params.get("size") if isinstance(vec_params, dict) else None
+        vec_size = vec_size or await _get_embed_dim()
         distance = vec_params.get("distance", "Cosine") if isinstance(vec_params, dict) else "Cosine"
 
         # Ensure archive collection exists
@@ -1544,7 +1760,8 @@ async def api_restore_doc_archive(doc_id: str, request: Request):
         if tgt_chk.status_code == 404:
             vec_params = (arc_chk.json().get("result", {})
                           .get("config", {}).get("params", {}).get("vectors", {}))
-            vec_size = vec_params.get("size", 1536) if isinstance(vec_params, dict) else 1536
+            vec_size = vec_params.get("size") if isinstance(vec_params, dict) else None
+            vec_size = vec_size or await _get_embed_dim()
             distance = vec_params.get("distance", "Cosine") if isinstance(vec_params, dict) else "Cosine"
             cr = await c.put(
                 f"{QDRANT_URL}/collections/{restore_to}",
@@ -1625,7 +1842,7 @@ async def api_create_collection(request: Request):
     name = (body.get("name") or "").strip()
     if not name or "/" in name or ".." in name:
         raise HTTPException(status_code=400, detail="Invalid collection name")
-    vec_size = int(body.get("vector_size", 1536))
+    vec_size = int(body.get("vector_size", 0)) or await _get_embed_dim()
     distance = body.get("distance", "Cosine")
     async with httpx.AsyncClient(timeout=30) as c:
         chk = await c.get(f"{QDRANT_URL}/collections/{name}")
@@ -1656,7 +1873,8 @@ async def api_rename_collection(name: str, request: Request):
             raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
         vec_params = (info_resp.json().get("result", {})
                       .get("config", {}).get("params", {}).get("vectors", {}))
-        vec_size = vec_params.get("size", 1536) if isinstance(vec_params, dict) else 1536
+        vec_size = vec_params.get("size") if isinstance(vec_params, dict) else None
+        vec_size = vec_size or await _get_embed_dim()
         distance = vec_params.get("distance", "Cosine") if isinstance(vec_params, dict) else "Cosine"
 
         chk = await c.get(f"{QDRANT_URL}/collections/{new_name}")
@@ -1714,7 +1932,8 @@ async def api_archive_collection(name: str):
             raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
         vec_params = (info_resp.json().get("result", {})
                       .get("config", {}).get("params", {}).get("vectors", {}))
-        vec_size = vec_params.get("size", 1536) if isinstance(vec_params, dict) else 1536
+        vec_size = vec_params.get("size") if isinstance(vec_params, dict) else None
+        vec_size = vec_size or await _get_embed_dim()
         distance = vec_params.get("distance", "Cosine") if isinstance(vec_params, dict) else "Cosine"
 
         cr = await c.put(
@@ -1852,7 +2071,8 @@ async def api_restore_archive(archive_name: str, request: Request):
             raise HTTPException(status_code=404, detail=f"Qdrant archive '{archive_name}' not found")
         vec_params = (info_resp.json().get("result", {})
                       .get("config", {}).get("params", {}).get("vectors", {}))
-        vec_size = vec_params.get("size", 1536) if isinstance(vec_params, dict) else 1536
+        vec_size = vec_params.get("size") if isinstance(vec_params, dict) else None
+        vec_size = vec_size or await _get_embed_dim()
         distance = vec_params.get("distance", "Cosine") if isinstance(vec_params, dict) else "Cosine"
 
         chk = await c.get(f"{QDRANT_URL}/collections/{target_name}")
@@ -1921,15 +2141,47 @@ async def api_search(
     q: str = Query(...),
     top_k: int = Query(8),
 ):
-    """Semantic search against a Qdrant collection."""
+    """Semantic search against a Qdrant collection.
+
+    Validates that the collection's vector dimension matches the active
+    embedding model before searching to prevent garbage scores.
+    """
     vector = await embed_text(q)
     if not vector:
         raise HTTPException(status_code=503, detail="Embedding unavailable — check OPENAI_API_KEY")
     try:
         async with httpx.AsyncClient(timeout=30) as c:
+            # Dimension guard — reject if collection dim != query dim
+            info = await c.get(f"{QDRANT_URL}/collections/{collection}")
+            if info.status_code == 404:
+                return {"results": [], "error": f"Collection '{collection}' not found"}
+            col_dim = (info.json().get("result", {})
+                       .get("config", {}).get("params", {})
+                       .get("vectors", {}).get("size"))
+            if col_dim and col_dim != len(vector):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Dimension mismatch: collection '{collection}' has {col_dim}-dim "
+                           f"vectors but current embedding model produces {len(vector)}-dim. "
+                           f"Re-embed the collection or switch EMBEDDING_BACKEND.",
+                )
+            now = _now_iso()
+            temporal_filter = {
+                "must": [
+                    {"should": [
+                        {"is_null": {"key": "valid_to"}},
+                        {"key": "valid_to", "range": {"gte": now}},
+                    ]},
+                    {"should": [
+                        {"is_null": {"key": "valid_from"}},
+                        {"key": "valid_from", "range": {"lte": now}},
+                    ]},
+                ],
+            }
             resp = await c.post(
                 f"{QDRANT_URL}/collections/{collection}/points/search",
-                json={"vector": vector, "limit": top_k, "with_payload": True},
+                json={"vector": vector, "limit": top_k, "with_payload": True,
+                      "filter": temporal_filter},
             )
             if resp.status_code == 404:
                 return {"results": [], "error": f"Collection '{collection}' not found"}
@@ -1953,11 +2205,14 @@ async def api_search(
 
 @app.post("/api/ingest")
 async def api_ingest(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     title: str = Form(""),
     agent_id: str = Form(""),
     access_level: str = Form("public"),
     enable_docint: str = Form("false"),   # "true" → run full Document Intelligence
+    collection: str = Form(""),           # target Qdrant collection (defaults to QDRANT_COLLECTION)
+    valid_hours: float = Form(0.0),       # >0 → chunk expires after this many hours
 ):
     """JSON-returning ingest endpoint used by the knowledge UI."""
     filename    = file.filename or "upload"
@@ -1977,8 +2232,13 @@ async def api_ingest(
     docint_summary: dict = {}
 
     try:
-        if use_docint:
-            # Full Document Intelligence pipeline
+        if ext in _MEDICAL_EXTS or _is_image(ext):
+            # Medical and image formats always use their dedicated handlers —
+            # DocInt pipeline does not understand DICOM/NIfTI/pixel data.
+            text, image_props = await _extract_image_text(filename, data, ext)
+            text = text.strip()
+        elif use_docint:
+            # Full Document Intelligence pipeline (PDFs, DOCX, scanned docs)
             result: DocIntelResult = await process_document(filename, data)
             text        = result.to_rich_text().strip()
             image_props = result.image_props
@@ -1999,9 +2259,6 @@ async def api_ingest(
             }
             # Store tables as separate Neo4j nodes (linked after main ingest)
             _docint_tables_pending[doc_id] = result.tables
-        elif _is_image(ext):
-            text, image_props = await _extract_image_text(filename, data, ext)
-            text = text.strip()
         else:
             text = _extract_text(filename, data).strip()
     except Exception as exc:
@@ -2012,11 +2269,22 @@ async def api_ingest(
     chunks = _chunk_text(text)
     if not chunks:
         raise HTTPException(status_code=422, detail="No chunks produced")
-    logger.info("API ingest '%s': %d chunks (ext=%s, docint=%s)", doc_title, len(chunks), ext, use_docint)
+    target_collection = collection.strip() or QDRANT_COLLECTION
+
+    from datetime import timedelta
+    valid_to = (
+        (datetime.now(timezone.utc) + timedelta(hours=valid_hours)).isoformat()
+        if valid_hours > 0 else None
+    )
+    logger.info(
+        "API ingest '%s': %d chunks (ext=%s, docint=%s, collection=%s, valid_to=%s)",
+        doc_title, len(chunks), ext, use_docint, target_collection, valid_to,
+    )
 
     try:
         _, chunk_eids = await _neo4j_ingest(
-            doc_id, doc_title, filename, chunks, agent_id, access_level, image_props
+            doc_id, doc_title, filename, chunks, agent_id, access_level, image_props,
+            valid_to=valid_to,
         )
     except Exception as exc:
         METRIC_INGEST_TOTAL.labels(status="neo4j_error").inc()
@@ -2030,7 +2298,10 @@ async def api_ingest(
             logger.warning("DocInt table Neo4j write failed: %s", e)
 
     try:
-        upserted = await _qdrant_ingest(QDRANT_COLLECTION, chunks, chunk_eids, doc_id, doc_title, agent_id, access_level)
+        upserted = await _qdrant_ingest(
+            target_collection, chunks, chunk_eids, doc_id, doc_title, agent_id, access_level,
+            valid_to=valid_to,
+        )
     except Exception as exc:
         METRIC_INGEST_TOTAL.labels(status="qdrant_error").inc()
         raise HTTPException(status_code=502, detail=f"Qdrant: {exc}")
@@ -2038,9 +2309,14 @@ async def api_ingest(
     METRIC_INGEST_TOTAL.labels(status="success").inc()
     METRIC_INGEST_CHUNKS.observe(len(chunks))
 
+    # NER entity extraction runs in the background so ingest response is immediate
+    background_tasks.add_task(_neo4j_create_mentions, chunk_eids, chunks)
+
     result_json = {"status": "ok", "document_id": doc_id, "title": doc_title,
                    "filename": filename, "chunks": len(chunks), "qdrant_points": upserted,
-                   "collection": QDRANT_COLLECTION}
+                   "collection": target_collection}
+    if valid_to:
+        result_json["valid_to"] = valid_to
     if image_props:
         result_json["image_metadata"] = image_props
     if docint_summary:
@@ -2050,6 +2326,211 @@ async def api_ingest(
 
 # In-memory staging for DocTable nodes created during /api/ingest
 _docint_tables_pending: dict[str, list] = {}
+
+
+@app.post("/api/ner-backfill")
+async def ner_backfill(
+    limit: int = Query(500, description="Max chunks to process per call"),
+):
+    """Run NER entity extraction on Chunk nodes that have no MENTIONS edges yet.
+
+    Calls Ollama (OLLAMA_MODEL) per chunk, creates :Entity nodes and MENTIONS
+    relationships.  Safe to call repeatedly — only touches unprocessed chunks.
+    """
+    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    try:
+        async with driver.session(database=NEO4J_DATABASE) as s:
+            result = await s.run(
+                """
+                MATCH (c:Chunk)
+                WHERE NOT (c)-[:MENTIONS]->()
+                  AND c.text IS NOT NULL
+                RETURN elementId(c) AS eid, c.text AS text
+                LIMIT $lim
+                """,
+                lim=limit,
+            )
+            rows = await result.data()
+    finally:
+        await driver.close()
+
+    if not rows:
+        return {"status": "ok", "processed": 0, "mentions_created": 0,
+                "message": "No unprocessed chunks found"}
+
+    chunk_eids  = [r["eid"]  for r in rows]
+    chunk_texts = [r["text"] or "" for r in rows]
+    mentions = await _neo4j_create_mentions(chunk_eids, chunk_texts)
+    return {
+        "status":          "ok",
+        "processed":       len(rows),
+        "mentions_created": mentions,
+    }
+
+
+@app.post("/api/graph-backfill")
+async def graph_backfill():
+    """Backfill NEXT chunk links and CO_OCCURS entity edges for all existing data.
+
+    Safe to call repeatedly — uses MERGE so relationships are idempotent.
+    """
+    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    try:
+        async with driver.session(database=NEO4J_DATABASE) as s:
+            # 1. Create NEXT links between consecutive chunks within each document
+            next_result = await s.run(
+                """
+                MATCH (d:Document)-[:CONTAINS]->(c:Chunk)
+                WITH d, c ORDER BY c.position
+                WITH d, collect(c) AS ordered
+                UNWIND range(0, size(ordered) - 2) AS i
+                WITH ordered[i] AS a, ordered[i + 1] AS b
+                MERGE (a)-[:NEXT]->(b)
+                RETURN count(*) AS next_created
+                """
+            )
+            next_count = (await next_result.single())["next_created"]
+
+            # 2. Create CO_OCCURS edges between entities sharing a chunk
+            cooc_result = await s.run(
+                """
+                MATCH (c:Chunk)-[:MENTIONS]->(e1:Entity)
+                MATCH (c)-[:MENTIONS]->(e2:Entity)
+                WHERE elementId(e1) < elementId(e2)
+                MERGE (e1)-[r:CO_OCCURS]->(e2)
+                  ON CREATE SET r.weight = 1, r.created_at = $now
+                  ON MATCH  SET r.weight = r.weight + 1
+                RETURN count(*) AS cooc_created
+                """,
+                now=_now_iso(),
+            )
+            cooc_count = (await cooc_result.single())["cooc_created"]
+    finally:
+        await driver.close()
+
+    return {
+        "status": "ok",
+        "next_links": next_count,
+        "co_occurs_edges": cooc_count,
+    }
+
+
+@app.post("/api/buddy-memory-migrate")
+async def buddy_memory_migrate(
+    source: str = Query("buddy_memory", description="Collection to migrate"),
+    batch_size: int = Query(32, description="Re-embedding batch size"),
+):
+    """Migrate a Qdrant collection from 3072-dim (OpenAI large) to 768-dim (nomic-embed-text).
+
+    Steps
+    -----
+    1. Scroll all points from *source* (preserving full payloads + old vectors).
+    2. Back them up as ``{source}_backup_3072`` — old dim intact, safe to restore.
+    3. Re-embed every point's ``text`` payload field via the configured Ollama
+       embedding model (OLLAMA_EMBEDDING_MODEL, typically nomic-embed-text → 768-dim).
+    4. Delete and recreate *source* with the new vector size.
+    5. Upsert all points with new vectors.
+
+    Returns a summary including old/new dimensions and backup collection name.
+    """
+    backup_name = f"{source}_backup_3072"
+
+    # ── 1. Scroll all existing points ─────────────────────────────────────────
+    all_points: list[dict] = []
+    offset = None
+    async with httpx.AsyncClient(timeout=60) as c:
+        while True:
+            body: dict = {"limit": 256, "with_payload": True, "with_vector": True}
+            if offset is not None:
+                body["offset"] = offset
+            resp = await c.post(
+                f"{QDRANT_URL}/collections/{source}/points/scroll",
+                json=body,
+            )
+            if resp.status_code == 404:
+                raise HTTPException(status_code=404, detail=f"Collection '{source}' not found")
+            resp.raise_for_status()
+            data = resp.json()["result"]
+            batch = data.get("points", [])
+            all_points.extend(batch)
+            offset = data.get("next_page_offset")
+            if not offset or not batch:
+                break
+
+    if not all_points:
+        raise HTTPException(status_code=422, detail=f"Collection '{source}' exists but has no points")
+
+    old_dim = len(all_points[0]["vector"])
+
+    # ── 2. Create backup of original vectors ──────────────────────────────────
+    async with httpx.AsyncClient(timeout=60) as c:
+        await c.delete(f"{QDRANT_URL}/collections/{backup_name}")
+        r = await c.put(
+            f"{QDRANT_URL}/collections/{backup_name}",
+            json={"vectors": {"size": old_dim, "distance": "Cosine"}},
+        )
+        r.raise_for_status()
+        for i in range(0, len(all_points), 256):
+            chunk = all_points[i : i + 256]
+            r = await c.put(
+                f"{QDRANT_URL}/collections/{backup_name}/points",
+                params={"wait": "true"},
+                json={"points": [
+                    {"id": p["id"], "vector": p["vector"], "payload": p.get("payload", {})}
+                    for p in chunk
+                ]},
+            )
+            r.raise_for_status()
+    logger.info("buddy-memory-migrate: backed up %d points → %s", len(all_points), backup_name)
+
+    # ── 3. Re-embed via Ollama (nomic-embed-text → 768-dim) ───────────────────
+    texts = [
+        (p.get("payload") or {}).get("text") or (p.get("payload") or {}).get("content") or ""
+        for p in all_points
+    ]
+    new_vectors: list[list[float]] = []
+    for i in range(0, len(texts), batch_size):
+        vecs = await _embed_batch(texts[i : i + batch_size])
+        new_vectors.extend(vecs)
+
+    new_dim = len(new_vectors[0]) if new_vectors else 768
+
+    # ── 4. Recreate source collection with new dimension ──────────────────────
+    async with httpx.AsyncClient(timeout=60) as c:
+        await c.delete(f"{QDRANT_URL}/collections/{source}")
+        r = await c.put(
+            f"{QDRANT_URL}/collections/{source}",
+            json={"vectors": {"size": new_dim, "distance": "Cosine"}},
+        )
+        r.raise_for_status()
+
+    # ── 5. Upsert re-embedded points ──────────────────────────────────────────
+    async with httpx.AsyncClient(timeout=120) as c:
+        for i in range(0, len(all_points), 256):
+            chunk   = all_points[i : i + 256]
+            ch_vecs = new_vectors[i : i + 256]
+            r = await c.put(
+                f"{QDRANT_URL}/collections/{source}/points",
+                params={"wait": "true"},
+                json={"points": [
+                    {"id": p["id"], "vector": vec, "payload": p.get("payload", {})}
+                    for p, vec in zip(chunk, ch_vecs)
+                ]},
+            )
+            r.raise_for_status()
+
+    logger.info(
+        "buddy-memory-migrate: %d points migrated %d→%d dim in '%s'",
+        len(all_points), old_dim, new_dim, source,
+    )
+    return {
+        "status":     "ok",
+        "collection": source,
+        "migrated":   len(all_points),
+        "old_dim":    old_dim,
+        "new_dim":    new_dim,
+        "backup":     backup_name,
+    }
 
 
 async def _neo4j_ingest_tables(doc_id: str, tables: list) -> None:
@@ -2634,9 +3115,129 @@ def _chunk_text(text: str, size: int = 2000, overlap: int = 200) -> list[str]:
     return chunks
 
 
+# ── NER Entity Extraction ─────────────────────────────────────────────────────
+
+async def _ner_extract(text: str) -> list[dict]:
+    """Call Ollama (OLLAMA_MODEL) to extract named entities from a chunk of text.
+
+    Uses response_format=json_object so Ollama is constrained to valid JSON.
+    Returns a list of dicts like {"text": "...", "type": "PERSON|ORG|..."}.
+    Falls back to [] on any error so ingest is never blocked.
+    """
+    system = (
+        "You are a named entity extractor. "
+        'Return a JSON object with a single key "entities" whose value is an array. '
+        'Each array item must have "text" (string) and "type" (one of: '
+        "PERSON, ORG, LOCATION, DATE, CONCEPT, TECH, PRODUCT, EVENT). "
+        "Include at most 15 of the most significant entities. "
+        "If there are none, return {\"entities\": []}."
+    )
+    user = f"Extract entities from:\n\n{text[:3000]}"
+    try:
+        async with httpx.AsyncClient(timeout=45) as c:
+            resp = await c.post(
+                f"{OLLAMA_BASE_URL}/v1/chat/completions",
+                json={
+                    "model":           OLLAMA_MODEL,
+                    "messages":        [
+                        {"role": "system", "content": system},
+                        {"role": "user",   "content": user},
+                    ],
+                    "temperature":     0,
+                    "response_format": {"type": "json_object"},
+                },
+            )
+            resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"].strip()
+        parsed = json.loads(content)
+        # Accept {"entities": [...]} or a bare array
+        if isinstance(parsed, list):
+            entities = parsed
+        else:
+            entities = parsed.get("entities") or parsed.get("Entities") or []
+            if not isinstance(entities, list):
+                entities = []
+        return [
+            e for e in entities
+            if isinstance(e, dict) and e.get("text") and e.get("type")
+        ]
+    except Exception as exc:
+        logger.warning("NER extraction failed: %s", exc)
+        return []
+
+
+_VALID_ENTITY_TYPES = frozenset(
+    {"PERSON", "ORG", "LOCATION", "DATE", "CONCEPT", "TECH", "PRODUCT", "EVENT"}
+)
+
+
+async def _neo4j_create_mentions(chunk_eids: list[str], chunks: list[str]) -> int:
+    """Extract entities per chunk and write :Entity nodes + MENTIONS rels to Neo4j.
+
+    Also creates :CO_OCCURS relationships between entities that appear in the
+    same chunk, which is the foundation for relational / graph reasoning.
+
+    Returns total number of MENTIONS relationships created.
+    Safe to call in a background task — errors are logged, not raised.
+    """
+    total = 0
+    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    try:
+        async with driver.session(database=NEO4J_DATABASE) as s:
+            for eid, text in zip(chunk_eids, chunks):
+                try:
+                    entities = await _ner_extract(text)
+                except Exception as exc:
+                    logger.warning("NER failed for chunk %s: %s", eid, exc)
+                    continue
+
+                # Deduplicate and validate entities for this chunk
+                seen_names: list[str] = []
+                for ent in entities:
+                    name  = str(ent.get("text", "")).strip()
+                    etype = str(ent.get("type", "CONCEPT")).strip().upper()
+                    if not name:
+                        continue
+                    if etype not in _VALID_ENTITY_TYPES:
+                        etype = "CONCEPT"
+                    await s.run(
+                        """
+                        MATCH (c:Chunk) WHERE elementId(c) = $eid
+                        MERGE (e:Entity {name: $name, type: $etype})
+                          ON CREATE SET e.created_at = $now
+                        MERGE (c)-[:MENTIONS]->(e)
+                        """,
+                        eid=eid, name=name, etype=etype, now=_now_iso(),
+                    )
+                    seen_names.append(name)
+                    total += 1
+
+                # Create CO_OCCURS edges between all entity pairs in this chunk
+                if len(seen_names) >= 2:
+                    await s.run(
+                        """
+                        MATCH (c:Chunk) WHERE elementId(c) = $eid
+                        MATCH (c)-[:MENTIONS]->(e1:Entity)
+                        MATCH (c)-[:MENTIONS]->(e2:Entity)
+                        WHERE elementId(e1) < elementId(e2)
+                        MERGE (e1)-[r:CO_OCCURS]->(e2)
+                          ON CREATE SET r.weight = 1, r.created_at = $now
+                          ON MATCH  SET r.weight = r.weight + 1
+                        """,
+                        eid=eid, now=_now_iso(),
+                    )
+    except Exception as exc:
+        logger.error("_neo4j_create_mentions failed: %s", exc)
+    finally:
+        await driver.close()
+    logger.info("NER backfill: %d MENTIONS created for %d chunks", total, len(chunk_eids))
+    return total
+
+
 async def _neo4j_ingest(doc_id: str, title: str, source: str,
                         chunks: list[str], agent_id: str, access_level: str,
-                        image_props: dict | None = None):
+                        image_props: dict | None = None,
+                        valid_to: str | None = None):
     driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
     now = _now_iso()
     try:
@@ -2665,21 +3266,33 @@ async def _neo4j_ingest(doc_id: str, title: str, source: str,
                          chunk_id: $cid, text: $text, position: $pos,
                          document_id: $doc_id, document_title: $title,
                          agent_id: $agent_id, access_level: $access_level,
-                         confidence: 1.0, created_at: $now
+                         confidence: 1.0, created_at: $now,
+                         valid_from: $now, valid_to: $valid_to
                        })
                        CREATE (d)-[:CONTAINS]->(c)
                        RETURN elementId(c) AS eid""",
                     doc_id=doc_id, cid=cid, text=text, pos=i,
-                    title=title, agent_id=agent_id, access_level=access_level, now=now,
+                    title=title, agent_id=agent_id, access_level=access_level,
+                    now=now, valid_to=valid_to,
                 )
                 chunk_eids.append((await c_rec.single())["eid"])
+
+            # Link consecutive chunks with :NEXT for traversal
+            for j in range(len(chunk_eids) - 1):
+                await s.run(
+                    """MATCH (a:Chunk) WHERE elementId(a) = $a
+                       MATCH (b:Chunk) WHERE elementId(b) = $b
+                       CREATE (a)-[:NEXT]->(b)""",
+                    a=chunk_eids[j], b=chunk_eids[j + 1],
+                )
         return doc_eid, chunk_eids
     finally:
         await driver.close()
 
 
 async def _qdrant_ingest(collection: str, chunks: list[str], chunk_eids: list[str],
-                         doc_id: str, title: str, agent_id: str, access_level: str):
+                         doc_id: str, title: str, agent_id: str, access_level: str,
+                         valid_to: str | None = None):
     now = _now_iso()
 
     # Embed in batches with retry + inter-batch delay
@@ -2718,7 +3331,7 @@ async def _qdrant_ingest(collection: str, chunks: list[str], chunk_eids: list[st
                 "access_level":     access_level,
                 "confidence":       1.0,
                 "valid_from":       now,
-                "valid_to":         None,
+                "valid_to":         valid_to,
             },
         })
 
@@ -2740,10 +3353,12 @@ async def ingest_form():
 
 @app.post("/ingest")
 async def ingest_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     title: str = Form(""),
     agent_id: str = Form(""),
     access_level: str = Form("public"),
+    valid_hours: float = Form(0.0),
 ):
     filename = file.filename or "upload"
     data = await file.read()
@@ -2777,11 +3392,20 @@ async def ingest_document(
     if not chunks:
         raise HTTPException(status_code=422, detail="File produced no chunks after extraction")
 
-    logger.info("Ingest '%s': %d chars → %d chunks (ext=%s)", doc_title, len(text), len(chunks), ext)
+    from datetime import timedelta
+    valid_to = (
+        (datetime.now(timezone.utc) + timedelta(hours=valid_hours)).isoformat()
+        if valid_hours > 0 else None
+    )
+    logger.info(
+        "Ingest '%s': %d chars → %d chunks (ext=%s, valid_to=%s)",
+        doc_title, len(text), len(chunks), ext, valid_to,
+    )
 
     try:
         doc_eid, chunk_eids = await _neo4j_ingest(
-            doc_id, doc_title, filename, chunks, agent_id, access_level, image_props
+            doc_id, doc_title, filename, chunks, agent_id, access_level, image_props,
+            valid_to=valid_to,
         )
     except Exception as exc:
         logger.error("Neo4j ingest failed: %s", exc)
@@ -2789,11 +3413,14 @@ async def ingest_document(
 
     try:
         upserted = await _qdrant_ingest(
-            QDRANT_COLLECTION, chunks, chunk_eids, doc_id, doc_title, agent_id, access_level
+            QDRANT_COLLECTION, chunks, chunk_eids, doc_id, doc_title, agent_id, access_level,
+            valid_to=valid_to,
         )
     except Exception as exc:
         logger.error("Qdrant ingest failed: %s", exc)
         raise HTTPException(status_code=502, detail=f"Qdrant ingest failed: {exc}")
+
+    background_tasks.add_task(_neo4j_create_mentions, chunk_eids, chunks)
 
     result = {
         "status":        "ok",
@@ -2805,6 +3432,8 @@ async def ingest_document(
         "qdrant_points": upserted,
         "collection":    QDRANT_COLLECTION,
     }
+    if valid_to:
+        result["valid_to"] = valid_to
     logger.info("Ingest complete: %s", result)
 
     return HTMLResponse(_RESULT_TMPL.format(
@@ -2812,3 +3441,4 @@ async def ingest_document(
         heading=f"✓ Ingested \"{doc_title}\"",
         body=json.dumps(result, indent=2),
     ))
+
