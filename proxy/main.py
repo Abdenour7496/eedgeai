@@ -158,6 +158,8 @@ EMBEDDING_MODEL   = os.getenv("EMBEDDING_MODEL",   "text-embedding-3-small")
 EMBED_BATCH_SIZE  = int(os.getenv("EMBED_BATCH_SIZE",  "32"))   # chunks per OpenAI call
 EMBED_BATCH_DELAY = float(os.getenv("EMBED_BATCH_DELAY", "0.5")) # seconds between batches
 EMBED_MAX_RETRIES = int(os.getenv("EMBED_MAX_RETRIES",  "6"))    # 429/5xx retry attempts
+LLM_MAX_RETRIES   = int(os.getenv("LLM_MAX_RETRIES",    "3"))    # 429/529/5xx chat retry attempts
+LLM_RETRY_BASE    = float(os.getenv("LLM_RETRY_BASE",  "1.0"))   # base delay for LLM retries
 
 # ── Qdrant (semantic perception layer) ────────────────────────────────────────
 QDRANT_URL        = os.getenv("QDRANT_URL",        "http://qdrant:6333")
@@ -943,38 +945,76 @@ async def call_openai(body: dict):
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     if body.get("stream"):
         async def stream():
-            try:
-                METRIC_LLM_REQUESTS.labels(backend="openai", status="started").inc()
-                async with httpx.AsyncClient(timeout=120) as c:
-                    async with c.stream("POST", "https://api.openai.com/v1/chat/completions",
-                                        json=body, headers=headers) as resp:
-                        if resp.status_code != 200:
-                            err = await resp.aread()
-                            logger.error("OpenAI %s: %s", resp.status_code, err[:200])
-                            METRIC_LLM_REQUESTS.labels(backend="openai", status="error").inc()
-                            yield f'data: {{"error": "OpenAI {resp.status_code}"}}\n\n'.encode()
+            for attempt in range(LLM_MAX_RETRIES + 1):
+                try:
+                    METRIC_LLM_REQUESTS.labels(backend="openai", status="started").inc()
+                    async with httpx.AsyncClient(timeout=120) as c:
+                        async with c.stream("POST", "https://api.openai.com/v1/chat/completions",
+                                            json=body, headers=headers) as resp:
+                            if resp.status_code != 200:
+                                err = await resp.aread()
+                                if _is_retryable(resp.status_code) and attempt < LLM_MAX_RETRIES:
+                                    ra = resp.headers.get("retry-after")
+                                    wait = float(ra) if ra else (LLM_RETRY_BASE * (2 ** attempt) + random.uniform(0, 0.5))
+                                    logger.warning("OpenAI %s (attempt %d/%d), retrying in %.1fs",
+                                                   resp.status_code, attempt + 1, LLM_MAX_RETRIES + 1, wait)
+                                    await asyncio.sleep(wait)
+                                    continue
+                                logger.error("OpenAI %s: %s", resp.status_code, err[:200])
+                                METRIC_LLM_REQUESTS.labels(backend="openai", status="error").inc()
+                                yield f'data: {{"error": "OpenAI {resp.status_code}"}}\n\n'.encode()
+                                return
+                            METRIC_LLM_REQUESTS.labels(backend="openai", status="success").inc()
+                            async for chunk in resp.aiter_bytes():
+                                yield chunk
                             return
-                        METRIC_LLM_REQUESTS.labels(backend="openai", status="success").inc()
-                        async for chunk in resp.aiter_bytes():
-                            yield chunk
-            except Exception as exc:
-                logger.error("OpenAI stream error: %s", exc)
-                METRIC_LLM_REQUESTS.labels(backend="openai", status="exception").inc()
-                yield b'data: {"error": "proxy error"}\n\n'
+                except Exception as exc:
+                    if attempt < LLM_MAX_RETRIES:
+                        wait = LLM_RETRY_BASE * (2 ** attempt) + random.uniform(0, 0.5)
+                        logger.warning("OpenAI stream error (attempt %d/%d): %s, retrying in %.1fs",
+                                       attempt + 1, LLM_MAX_RETRIES + 1, exc, wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    logger.error("OpenAI stream error: %s", exc)
+                    METRIC_LLM_REQUESTS.labels(backend="openai", status="exception").inc()
+                    yield b'data: {"error": "proxy error"}\n\n'
+                    return
         return StreamingResponse(stream(), media_type="text/event-stream")
     else:
         t0 = time.monotonic()
-        try:
-            async with httpx.AsyncClient(timeout=120) as c:
-                resp = await c.post("https://api.openai.com/v1/chat/completions",
-                                    json=body, headers=headers)
-                resp.raise_for_status()
-            METRIC_LLM_REQUESTS.labels(backend="openai", status="success").inc()
-            METRIC_LLM_DURATION.labels(backend="openai").observe(time.monotonic() - t0)
-            return JSONResponse(content=resp.json(), status_code=resp.status_code)
-        except Exception:
-            METRIC_LLM_REQUESTS.labels(backend="openai", status="error").inc()
-            raise
+        for attempt in range(LLM_MAX_RETRIES + 1):
+            try:
+                async with httpx.AsyncClient(timeout=120) as c:
+                    resp = await c.post("https://api.openai.com/v1/chat/completions",
+                                        json=body, headers=headers)
+                    if _is_retryable(resp.status_code) and attempt < LLM_MAX_RETRIES:
+                        ra = resp.headers.get("retry-after")
+                        wait = float(ra) if ra else (LLM_RETRY_BASE * (2 ** attempt) + random.uniform(0, 0.5))
+                        logger.warning("OpenAI %s (attempt %d/%d), retrying in %.1fs",
+                                       resp.status_code, attempt + 1, LLM_MAX_RETRIES + 1, wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    resp.raise_for_status()
+                METRIC_LLM_REQUESTS.labels(backend="openai", status="success").inc()
+                METRIC_LLM_DURATION.labels(backend="openai").observe(time.monotonic() - t0)
+                return JSONResponse(content=resp.json(), status_code=resp.status_code)
+            except httpx.HTTPStatusError:
+                METRIC_LLM_REQUESTS.labels(backend="openai", status="error").inc()
+                raise
+            except Exception:
+                if attempt < LLM_MAX_RETRIES:
+                    wait = LLM_RETRY_BASE * (2 ** attempt) + random.uniform(0, 0.5)
+                    logger.warning("OpenAI non-stream error (attempt %d/%d), retrying in %.1fs",
+                                   attempt + 1, LLM_MAX_RETRIES + 1, wait)
+                    await asyncio.sleep(wait)
+                    continue
+                METRIC_LLM_REQUESTS.labels(backend="openai", status="error").inc()
+                raise
+
+
+def _is_retryable(status_code: int) -> bool:
+    """Return True for status codes that warrant a retry (rate-limit, overloaded, server error)."""
+    return status_code in (429, 529) or status_code >= 500
 
 
 async def call_anthropic(body: dict):
@@ -991,63 +1031,99 @@ async def call_anthropic(body: dict):
     if body.get("stream"):
         ant_body["stream"] = True
         async def stream():
-            try:
-                METRIC_LLM_REQUESTS.labels(backend="anthropic", status="started").inc()
-                async with httpx.AsyncClient(timeout=120) as c:
-                    async with c.stream("POST", "https://api.anthropic.com/v1/messages",
-                                        json=ant_body, headers=headers) as resp:
-                        if resp.status_code != 200:
-                            err = await resp.aread()
-                            logger.error("Anthropic %s: %s", resp.status_code, err[:200])
-                            METRIC_LLM_REQUESTS.labels(backend="anthropic", status="error").inc()
-                            yield f'data: {{"error": "Anthropic {resp.status_code}"}}\n\n'.encode()
+            last_err = None
+            for attempt in range(LLM_MAX_RETRIES + 1):
+                try:
+                    METRIC_LLM_REQUESTS.labels(backend="anthropic", status="started").inc()
+                    async with httpx.AsyncClient(timeout=120) as c:
+                        async with c.stream("POST", "https://api.anthropic.com/v1/messages",
+                                            json=ant_body, headers=headers) as resp:
+                            if resp.status_code != 200:
+                                err = await resp.aread()
+                                last_err = f"Anthropic {resp.status_code}"
+                                if _is_retryable(resp.status_code) and attempt < LLM_MAX_RETRIES:
+                                    ra = resp.headers.get("retry-after")
+                                    wait = float(ra) if ra else (LLM_RETRY_BASE * (2 ** attempt) + random.uniform(0, 0.5))
+                                    logger.warning("Anthropic %s (attempt %d/%d), retrying in %.1fs",
+                                                   resp.status_code, attempt + 1, LLM_MAX_RETRIES + 1, wait)
+                                    await asyncio.sleep(wait)
+                                    continue
+                                logger.error("Anthropic %s: %s", resp.status_code, err[:200])
+                                METRIC_LLM_REQUESTS.labels(backend="anthropic", status="error").inc()
+                                yield f'data: {{"error": "Anthropic {resp.status_code}"}}\n\n'.encode()
+                                return
+                            METRIC_LLM_REQUESTS.labels(backend="anthropic", status="success").inc()
+                            async for line in resp.aiter_lines():
+                                if not line.startswith("data: "):
+                                    continue
+                                raw = line[6:]
+                                if raw == "[DONE]":
+                                    yield b"data: [DONE]\n\n"; continue
+                                try:
+                                    evt = json.loads(raw)
+                                    if evt.get("type") == "content_block_delta":
+                                        txt = evt.get("delta", {}).get("text", "")
+                                        yield f'data: {json.dumps({"choices": [{"delta": {"content": txt}, "finish_reason": None}]})}\n\n'.encode()
+                                    elif evt.get("type") == "message_stop":
+                                        yield b"data: [DONE]\n\n"
+                                except json.JSONDecodeError:
+                                    pass
                             return
-                        METRIC_LLM_REQUESTS.labels(backend="anthropic", status="success").inc()
-                        async for line in resp.aiter_lines():
-                            if not line.startswith("data: "):
-                                continue
-                            raw = line[6:]
-                            if raw == "[DONE]":
-                                yield b"data: [DONE]\n\n"; continue
-                            try:
-                                evt = json.loads(raw)
-                                if evt.get("type") == "content_block_delta":
-                                    txt = evt.get("delta", {}).get("text", "")
-                                    yield f'data: {json.dumps({"choices": [{"delta": {"content": txt}, "finish_reason": None}]})}\n\n'.encode()
-                                elif evt.get("type") == "message_stop":
-                                    yield b"data: [DONE]\n\n"
-                            except json.JSONDecodeError:
-                                pass
-            except Exception as exc:
-                logger.error("Anthropic stream error: %s", exc)
-                METRIC_LLM_REQUESTS.labels(backend="anthropic", status="exception").inc()
-                yield b'data: {"error": "proxy error"}\n\n'
+                except Exception as exc:
+                    last_err = str(exc)
+                    if attempt < LLM_MAX_RETRIES:
+                        wait = LLM_RETRY_BASE * (2 ** attempt) + random.uniform(0, 0.5)
+                        logger.warning("Anthropic stream error (attempt %d/%d): %s, retrying in %.1fs",
+                                       attempt + 1, LLM_MAX_RETRIES + 1, exc, wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    logger.error("Anthropic stream error: %s", exc)
+                    METRIC_LLM_REQUESTS.labels(backend="anthropic", status="exception").inc()
+                    yield b'data: {"error": "proxy error"}\n\n'
+                    return
         return StreamingResponse(stream(), media_type="text/event-stream")
     else:
         t0 = time.monotonic()
-        try:
-            async with httpx.AsyncClient(timeout=120) as c:
-                resp = await c.post("https://api.anthropic.com/v1/messages",
-                                    json=ant_body, headers=headers)
-                resp.raise_for_status()
-            METRIC_LLM_REQUESTS.labels(backend="anthropic", status="success").inc()
-            METRIC_LLM_DURATION.labels(backend="anthropic").observe(time.monotonic() - t0)
-            ant = resp.json()
-            usage = ant.get("usage", {})
-            return JSONResponse(content={
-                "id": ant.get("id", ""), "object": "chat.completion",
-                "model": ant.get("model", ant_body["model"]),
-                "choices": [{"index": 0,
-                             "message": {"role": "assistant",
-                                         "content": ant.get("content", [{}])[0].get("text", "")},
-                             "finish_reason": ant.get("stop_reason", "stop")}],
-                "usage": {"prompt_tokens":    usage.get("input_tokens", 0),
-                          "completion_tokens": usage.get("output_tokens", 0),
-                          "total_tokens":      usage.get("input_tokens", 0) + usage.get("output_tokens", 0)},
-            })
-        except Exception:
-            METRIC_LLM_REQUESTS.labels(backend="anthropic", status="error").inc()
-            raise
+        for attempt in range(LLM_MAX_RETRIES + 1):
+            try:
+                async with httpx.AsyncClient(timeout=120) as c:
+                    resp = await c.post("https://api.anthropic.com/v1/messages",
+                                        json=ant_body, headers=headers)
+                    if _is_retryable(resp.status_code) and attempt < LLM_MAX_RETRIES:
+                        ra = resp.headers.get("retry-after")
+                        wait = float(ra) if ra else (LLM_RETRY_BASE * (2 ** attempt) + random.uniform(0, 0.5))
+                        logger.warning("Anthropic %s (attempt %d/%d), retrying in %.1fs",
+                                       resp.status_code, attempt + 1, LLM_MAX_RETRIES + 1, wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    resp.raise_for_status()
+                METRIC_LLM_REQUESTS.labels(backend="anthropic", status="success").inc()
+                METRIC_LLM_DURATION.labels(backend="anthropic").observe(time.monotonic() - t0)
+                ant = resp.json()
+                usage = ant.get("usage", {})
+                return JSONResponse(content={
+                    "id": ant.get("id", ""), "object": "chat.completion",
+                    "model": ant.get("model", ant_body["model"]),
+                    "choices": [{"index": 0,
+                                 "message": {"role": "assistant",
+                                             "content": ant.get("content", [{}])[0].get("text", "")},
+                                 "finish_reason": ant.get("stop_reason", "stop")}],
+                    "usage": {"prompt_tokens":    usage.get("input_tokens", 0),
+                              "completion_tokens": usage.get("output_tokens", 0),
+                              "total_tokens":      usage.get("input_tokens", 0) + usage.get("output_tokens", 0)},
+                })
+            except httpx.HTTPStatusError:
+                METRIC_LLM_REQUESTS.labels(backend="anthropic", status="error").inc()
+                raise
+            except Exception:
+                if attempt < LLM_MAX_RETRIES:
+                    wait = LLM_RETRY_BASE * (2 ** attempt) + random.uniform(0, 0.5)
+                    logger.warning("Anthropic non-stream error (attempt %d/%d), retrying in %.1fs",
+                                   attempt + 1, LLM_MAX_RETRIES + 1, wait)
+                    await asyncio.sleep(wait)
+                    continue
+                METRIC_LLM_REQUESTS.labels(backend="anthropic", status="error").inc()
+                raise
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────

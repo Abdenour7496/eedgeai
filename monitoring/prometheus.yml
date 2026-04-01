@@ -19,11 +19,6 @@ scrape_configs:
     static_configs:
       - targets: ['ollama:11434']
 
-  - job_name: 'memory-server'
-    metrics_path: /metrics
-    static_configs:
-      - targets: ['host.docker.internal:4242']
-
   - job_name: 'neo4j'
     metrics_path: /metrics
     static_configs:
