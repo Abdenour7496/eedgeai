@@ -4,7 +4,10 @@
   },
   "agents": {
     "defaults": {
-      "model": "openai/gpt-4o"
+      "model": {
+        "primary": "github-copilot/gpt-5.4",
+        "fallbacks": ["github-copilot/gpt-4.1"]
+      }
     }
   }
 }
