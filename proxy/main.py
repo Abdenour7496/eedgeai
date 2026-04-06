@@ -151,6 +151,11 @@ LLM_BACKEND          = os.getenv("LLM_BACKEND", "openai")   # openai | anthropic
 OPENCLAW_BASE_URL      = os.getenv("OPENCLAW_BASE_URL",      "http://openclaw:18799/v1")
 OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
 
+# ── GitHub Copilot (OpenClaw fallback) ──────────────────────────────────────────
+COPILOT_API_KEY    = os.getenv("COPILOT_API_KEY", "")          # GitHub token with Copilot access
+COPILOT_BASE_URL   = os.getenv("COPILOT_BASE_URL", "https://api.githubcopilot.com")
+COPILOT_CHAT_MODEL = os.getenv("COPILOT_CHAT_MODEL", "gpt-4.1")
+
 # ── Ollama ─────────────────────────────────────────────────────────────────────
 OLLAMA_BASE_URL        = os.getenv("OLLAMA_BASE_URL",        "http://ollama:11434")
 OLLAMA_MODEL           = os.getenv("OLLAMA_MODEL",           "llama3.2")
@@ -1050,6 +1055,8 @@ def _resolve_model(model: str) -> tuple:
     if model == "openclaw":
         if LLM_BACKEND == "openclaw":
             return "openclaw", "openclaw"
+        if LLM_BACKEND == "copilot":
+            return COPILOT_CHAT_MODEL, "copilot"
         if LLM_BACKEND == "ollama":
             return OLLAMA_MODEL, "ollama"
         if LLM_BACKEND == "openai":
@@ -1061,6 +1068,8 @@ def _resolve_model(model: str) -> tuple:
         return model, "openai"
     if LLM_BACKEND == "openclaw":
         return "openclaw", "openclaw"
+    if LLM_BACKEND == "copilot":
+        return COPILOT_CHAT_MODEL, "copilot"
     if LLM_BACKEND == "anthropic":
         return ANTHROPIC_CHAT_MODEL, "anthropic"
     if LLM_BACKEND == "ollama":
@@ -1143,6 +1152,86 @@ async def call_openclaw(body: dict):
         except Exception:
             METRIC_LLM_REQUESTS.labels(backend="openclaw", status="error").inc()
             raise
+
+
+async def call_copilot(body: dict):
+    """Forward chat completions to GitHub Copilot (OpenAI-compatible, gpt-4.1)."""
+    url = f"{COPILOT_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {COPILOT_API_KEY}",
+        "Content-Type": "application/json",
+        "Copilot-Integration-Id": "vscode-chat",
+        "Editor-Version": "vscode/1.90.0",
+        "Editor-Plugin-Version": "copilot-chat/0.22.4",
+        "Openai-Intent": "conversation-panel",
+        "x-github-api-version": "2023-07-07",
+    }
+    body = {**body, "model": body.get("model", COPILOT_CHAT_MODEL)}
+    if body.get("stream"):
+        async def stream():
+            for attempt in range(LLM_MAX_RETRIES + 1):
+                try:
+                    METRIC_LLM_REQUESTS.labels(backend="copilot", status="started").inc()
+                    async with httpx.AsyncClient(timeout=120) as c:
+                        async with c.stream("POST", url, json=body, headers=headers) as resp:
+                            if resp.status_code != 200:
+                                err = await resp.aread()
+                                if _is_retryable(resp.status_code) and attempt < LLM_MAX_RETRIES:
+                                    ra = resp.headers.get("retry-after")
+                                    wait = float(ra) if ra else (LLM_RETRY_BASE * (2 ** attempt) + random.uniform(0, 0.5))
+                                    logger.warning("Copilot %s (attempt %d/%d), retrying in %.1fs",
+                                                   resp.status_code, attempt + 1, LLM_MAX_RETRIES + 1, wait)
+                                    await asyncio.sleep(wait)
+                                    continue
+                                logger.error("Copilot %s: %s", resp.status_code, err[:200])
+                                METRIC_LLM_REQUESTS.labels(backend="copilot", status="error").inc()
+                                yield f'data: {{"error": "Copilot {resp.status_code}"}}\n\n'.encode()
+                                return
+                            METRIC_LLM_REQUESTS.labels(backend="copilot", status="success").inc()
+                            async for chunk in resp.aiter_bytes():
+                                yield chunk
+                            return
+                except Exception as exc:
+                    if attempt < LLM_MAX_RETRIES:
+                        wait = LLM_RETRY_BASE * (2 ** attempt) + random.uniform(0, 0.5)
+                        logger.warning("Copilot stream error (attempt %d/%d): %s, retrying in %.1fs",
+                                       attempt + 1, LLM_MAX_RETRIES + 1, exc, wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    logger.error("Copilot stream error: %s", exc)
+                    METRIC_LLM_REQUESTS.labels(backend="copilot", status="exception").inc()
+                    yield b'data: {"error": "proxy error"}\n\n'
+                    return
+        return StreamingResponse(stream(), media_type="text/event-stream")
+    else:
+        t0 = time.monotonic()
+        for attempt in range(LLM_MAX_RETRIES + 1):
+            try:
+                async with httpx.AsyncClient(timeout=120) as c:
+                    resp = await c.post(url, json=body, headers=headers)
+                    if _is_retryable(resp.status_code) and attempt < LLM_MAX_RETRIES:
+                        ra = resp.headers.get("retry-after")
+                        wait = float(ra) if ra else (LLM_RETRY_BASE * (2 ** attempt) + random.uniform(0, 0.5))
+                        logger.warning("Copilot %s (attempt %d/%d), retrying in %.1fs",
+                                       resp.status_code, attempt + 1, LLM_MAX_RETRIES + 1, wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    resp.raise_for_status()
+                METRIC_LLM_REQUESTS.labels(backend="copilot", status="success").inc()
+                METRIC_LLM_DURATION.labels(backend="copilot").observe(time.monotonic() - t0)
+                return JSONResponse(content=resp.json(), status_code=resp.status_code)
+            except httpx.HTTPStatusError:
+                METRIC_LLM_REQUESTS.labels(backend="copilot", status="error").inc()
+                raise
+            except Exception:
+                if attempt < LLM_MAX_RETRIES:
+                    wait = LLM_RETRY_BASE * (2 ** attempt) + random.uniform(0, 0.5)
+                    logger.warning("Copilot non-stream error (attempt %d/%d), retrying in %.1fs",
+                                   attempt + 1, LLM_MAX_RETRIES + 1, wait)
+                    await asyncio.sleep(wait)
+                    continue
+                METRIC_LLM_REQUESTS.labels(backend="copilot", status="error").inc()
+                raise
 
 
 async def call_openai(body: dict):
@@ -1462,7 +1551,79 @@ async def chat_completions(request: Request):
     body = {**body, "model": model}
     try:
         if backend == "openclaw":
-            return await call_openclaw(body)
+            if body.get("stream") and COPILOT_API_KEY:
+                # Streaming: build inline fallback generator (exceptions inside
+                # StreamingResponse generators are not catchable from outside).
+                oc_url = f"{OPENCLAW_BASE_URL}/chat/completions"
+                oc_hdrs = {"Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}",
+                           "Content-Type": "application/json"}
+                cp_url = f"{COPILOT_BASE_URL}/chat/completions"
+                cp_hdrs = {
+                    "Authorization": f"Bearer {COPILOT_API_KEY}",
+                    "Content-Type": "application/json",
+                    "Copilot-Integration-Id": "vscode-chat",
+                    "Editor-Version": "vscode/1.90.0",
+                    "Editor-Plugin-Version": "copilot-chat/0.22.4",
+                    "Openai-Intent": "conversation-panel",
+                    "x-github-api-version": "2023-07-07",
+                }
+                cp_body = {**body, "model": COPILOT_CHAT_MODEL}
+
+                async def _stream_openclaw_or_copilot():
+                    oc_ok = False
+                    try:
+                        METRIC_LLM_REQUESTS.labels(backend="openclaw", status="started").inc()
+                        async with httpx.AsyncClient(timeout=300) as c:
+                            async with c.stream("POST", oc_url, json=body, headers=oc_hdrs) as resp:
+                                if resp.status_code == 200:
+                                    METRIC_LLM_REQUESTS.labels(backend="openclaw", status="success").inc()
+                                    oc_ok = True
+                                    async for chunk in resp.aiter_bytes():
+                                        yield chunk
+                                    return
+                                err = await resp.aread()
+                                logger.warning("OpenClaw %s, falling back to Copilot gpt-4.1: %s",
+                                               resp.status_code, err[:200])
+                                METRIC_LLM_REQUESTS.labels(backend="openclaw", status="error").inc()
+                    except Exception as exc:
+                        logger.warning("OpenClaw stream error, falling back to Copilot: %s", exc)
+                        METRIC_LLM_REQUESTS.labels(backend="openclaw", status="exception").inc()
+
+                    if oc_ok:
+                        return
+
+                    logger.info("Streaming via GitHub Copilot gpt-4.1 fallback")
+                    METRIC_LLM_REQUESTS.labels(backend="copilot", status="started").inc()
+                    try:
+                        async with httpx.AsyncClient(timeout=120) as c:
+                            async with c.stream("POST", cp_url, json=cp_body, headers=cp_hdrs) as resp:
+                                if resp.status_code != 200:
+                                    err = await resp.aread()
+                                    logger.error("Copilot fallback %s: %s", resp.status_code, err[:200])
+                                    METRIC_LLM_REQUESTS.labels(backend="copilot", status="error").inc()
+                                    yield f'data: {{"error": "All backends failed ({resp.status_code})"}}\n\n'.encode()
+                                    return
+                                METRIC_LLM_REQUESTS.labels(backend="copilot", status="success").inc()
+                                async for chunk in resp.aiter_bytes():
+                                    yield chunk
+                    except Exception as exc:
+                        logger.error("Copilot fallback stream error: %s", exc)
+                        METRIC_LLM_REQUESTS.labels(backend="copilot", status="exception").inc()
+                        yield b'data: {"error": "proxy error"}\n\n'
+
+                return StreamingResponse(_stream_openclaw_or_copilot(), media_type="text/event-stream")
+            else:
+                # Non-streaming (or no Copilot key) — exceptions propagate to outer handler
+                try:
+                    return await call_openclaw(body)
+                except Exception as exc:
+                    if COPILOT_API_KEY:
+                        logger.warning("OpenClaw failed (%s), falling back to Copilot gpt-4.1", exc)
+                        METRIC_LLM_REQUESTS.labels(backend="copilot", status="fallback").inc()
+                        return await call_copilot({**body, "model": COPILOT_CHAT_MODEL})
+                    raise
+        elif backend == "copilot" and COPILOT_API_KEY:
+            return await call_copilot(body)
         elif backend == "ollama":
             return await call_ollama(body)
         elif backend == "anthropic" and ANTHROPIC_API_KEY:
