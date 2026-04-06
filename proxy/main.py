@@ -1162,7 +1162,9 @@ async def call_copilot(body: dict):
         "Content-Type": "application/json",
         "Copilot-Integration-Id": "vscode-chat",
         "Editor-Version": "vscode/1.90.0",
-        "Editor-Plugin-Version": "GitHub.copilot/1.0.0",
+        "Editor-Plugin-Version": "copilot-chat/0.22.4",
+        "Openai-Intent": "conversation-panel",
+        "x-github-api-version": "2023-07-07",
     }
     body = {**body, "model": body.get("model", COPILOT_CHAT_MODEL)}
     if body.get("stream"):
@@ -1561,7 +1563,9 @@ async def chat_completions(request: Request):
                     "Content-Type": "application/json",
                     "Copilot-Integration-Id": "vscode-chat",
                     "Editor-Version": "vscode/1.90.0",
-                    "Editor-Plugin-Version": "GitHub.copilot/1.0.0",
+                    "Editor-Plugin-Version": "copilot-chat/0.22.4",
+                    "Openai-Intent": "conversation-panel",
+                    "x-github-api-version": "2023-07-07",
                 }
                 cp_body = {**body, "model": COPILOT_CHAT_MODEL}
 
