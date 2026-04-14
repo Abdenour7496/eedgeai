@@ -19,7 +19,7 @@ function forward(fromPort, toPort, label) {
   net.createServer(s => {
     counters[key].active++;
     counters[key].total++;
-    const t = net.connect(toPort, '::1', () => { s.pipe(t); t.pipe(s); });
+    const t = net.connect(toPort, '127.0.0.1', () => { s.pipe(t); t.pipe(s); });
     const cleanup = () => { counters[key].active = Math.max(0, counters[key].active - 1); };
     t.on('error', () => { s.destroy(); });
     s.on('error', () => { t.destroy(); });

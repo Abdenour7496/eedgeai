@@ -49,9 +49,11 @@ VISION_MAX_PX   = int(os.getenv("VISION_MAX_PX", "1024"))
 OPENAI_KEY      = os.getenv("OPENAI_API_KEY", "")
 ANTHROPIC_KEY   = os.getenv("ANTHROPIC_API_KEY", "")
 LLM_BACKEND     = os.getenv("LLM_BACKEND", "openai")
+VISION_BACKEND  = os.getenv("VISION_BACKEND") or LLM_BACKEND
 CHAT_MODEL      = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")
-VISION_MODEL    = os.getenv("VISION_MODEL", "gpt-4o")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_CHAT_MODEL", "claude-sonnet-4-6")
+VISION_MODEL    = os.getenv("VISION_MODEL",
+                            ANTHROPIC_MODEL if VISION_BACKEND == "anthropic" else "gpt-4o")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3.2")
 MAX_TOKENS_TEXT = 2048
@@ -204,7 +206,9 @@ async def _chat(messages: list[dict], max_tokens: int = MAX_TOKENS_TEXT) -> str:
 
 async def _vision(png_b64: str, prompt: str, max_tokens: int = MAX_TOKENS_VIS) -> str:
     """Call the vision model with a PNG image (base64) and a text prompt."""
-    if LLM_BACKEND == "ollama":
+    _vb = VISION_BACKEND   # respects VISION_BACKEND env, falls back to LLM_BACKEND
+
+    if _vb == "ollama":
         # Use Ollama vision-capable model (e.g. llava, llama3.2-vision)
         async with httpx.AsyncClient(timeout=120) as c:
             r = await c.post(
@@ -219,7 +223,7 @@ async def _vision(png_b64: str, prompt: str, max_tokens: int = MAX_TOKENS_VIS) -
             r.raise_for_status()
             return r.json()["choices"][0]["message"]["content"].strip()
 
-    if LLM_BACKEND == "anthropic" and ANTHROPIC_KEY:
+    if _vb == "anthropic" and ANTHROPIC_KEY:
         async with httpx.AsyncClient(timeout=60) as c:
             r = await c.post(
                 "https://api.anthropic.com/v1/messages",

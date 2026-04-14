@@ -7,7 +7,7 @@ agents:
   retriever_agent:
     type: retriever
     tools:
-      - semantic_search_quarant
+      - semantic_search_qdrant
       - query_neo4j
 
   kg_writer_agent:

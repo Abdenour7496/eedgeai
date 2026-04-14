@@ -1,10 +1,97 @@
 {
   "gateway": {
-    "mode": "local"
+    "mode": "local",
+    "auth": {
+      "mode": "token"
+    },
+    "http": {
+      "endpoints": {
+        "chatCompletions": {
+          "enabled": true
+        }
+      }
+    }
+  },
+  "models": {
+    "providers": {
+      "ollama": {
+        "baseUrl": "http://ollama:11434",
+        "apiKey": "ollama-local",
+        "api": "ollama",
+        "models": [
+          {
+            "id": "llama3.2:latest",
+            "name": "llama3.2:latest",
+            "api": "ollama",
+            "reasoning": true,
+            "input": ["text"],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 128000,
+            "maxTokens": 8192
+          }
+        ]
+      }
+    }
   },
   "agents": {
     "defaults": {
-      "model": "openai/gpt-4o"
+      "model": {
+        "primary": "github-copilot/gpt-4.1",
+        "fallbacks": [
+          "github-copilot/gpt-5.4",
+          "ollama/llama3.2:latest"
+        ]
+      },
+      "models": {
+        "github-copilot/gpt-5.4": {
+          "alias": "copilot"
+        },
+        "github-copilot/gpt-4.1": {
+          "alias": "gpt-4.1"
+        },
+        "ollama/llama3.2:latest": {
+          "alias": "local"
+        }
+      },
+      "memorySearch": {
+        "provider": "ollama",
+        "fallback": "none",
+        "model": "nomic-embed-text",
+        "outputDimensionality": 768
+      },
+      "heartbeat": {
+        "model": "github-copilot/gpt-4.1"
+      }
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true
+    }
+  },
+  "mcp": {
+    "servers": {
+      "qdrant-memory": {
+        "type": "sse",
+        "url": "http://mcp-qdrant:8765/sse"
+      },
+      "neo4j-graph": {
+        "type": "sse",
+        "url": "http://mcp-neo4j:8766/sse"
+      }
+    }
+  },
+  "auth": {
+    "profiles": {
+      "github-copilot:github": {
+        "provider": "github-copilot",
+        "mode": "token"
+      }
     }
   }
 }

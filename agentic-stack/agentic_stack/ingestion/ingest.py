@@ -178,7 +178,7 @@ def neo4j_create_document(session, doc_id: str, title: str, source: str) -> str:
     """MERGE a Document node and return its elementId."""
     result = session.run(
         """
-        MERGE (d:Document {id: $id})
+        MERGE (d:Document {document_id: $id})
         ON CREATE SET d.title    = $title,
                       d.source   = $source,
                       d.created_at = $now
@@ -195,13 +195,13 @@ def neo4j_create_chunk(session, chunk_id: str, doc_id: str,
     """Create a Chunk node linked to its Document; return elementId."""
     result = session.run(
         """
-        MERGE (c:Chunk {id: $id})
+        MERGE (c:Chunk {chunk_id: $id})
         ON CREATE SET c.text        = $text,
                       c.position    = $position,
                       c.document_id = $doc_id,
                       c.created_at  = $now
         WITH c
-        MATCH (d:Document {id: $doc_id})
+        MATCH (d:Document {document_id: $doc_id})
         MERGE (d)-[:HAS_CHUNK]->(c)
         RETURN elementId(c) AS eid
         """,
@@ -212,11 +212,11 @@ def neo4j_create_chunk(session, chunk_id: str, doc_id: str,
 
 
 def neo4j_link_sequential_chunks(session, prev_id: str, curr_id: str) -> None:
-    """Create FOLLOWS relationship between consecutive chunks."""
+    """Create NEXT relationship between consecutive chunks."""
     session.run(
         """
-        MATCH (a:Chunk {id: $prev}), (b:Chunk {id: $curr})
-        MERGE (a)-[:FOLLOWS]->(b)
+        MATCH (a:Chunk {chunk_id: $prev}), (b:Chunk {chunk_id: $curr})
+        MERGE (a)-[:NEXT]->(b)
         """,
         prev=prev_id, curr=curr_id,
     )
@@ -229,7 +229,7 @@ def neo4j_create_concepts(session, chunk_id: str, concepts: list) -> None:
             """
             MERGE (concept:Concept {name: $name})
             WITH concept
-            MATCH (c:Chunk {id: $chunk_id})
+            MATCH (c:Chunk {chunk_id: $chunk_id})
             MERGE (c)-[:MENTIONS]->(concept)
             """,
             name=name, chunk_id=chunk_id,

@@ -71,8 +71,8 @@ PASSWORD = os.getenv("NEO4J_PASSWORD", "test1234")
 # ── Uniqueness constraints ─────────────────────────────────────────────────────
 CONSTRAINTS = [
     # Core document graph
-    "CREATE CONSTRAINT document_id  IF NOT EXISTS FOR (n:Document)  REQUIRE n.id IS UNIQUE",
-    "CREATE CONSTRAINT chunk_id     IF NOT EXISTS FOR (n:Chunk)     REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT document_id  IF NOT EXISTS FOR (n:Document)  REQUIRE n.document_id IS UNIQUE",
+    "CREATE CONSTRAINT chunk_id     IF NOT EXISTS FOR (n:Chunk)     REQUIRE n.chunk_id IS UNIQUE",
     "CREATE CONSTRAINT concept_name IF NOT EXISTS FOR (n:Concept)   REQUIRE n.name IS UNIQUE",
     "CREATE CONSTRAINT entity_name  IF NOT EXISTS FOR (n:Entity)    REQUIRE n.name IS UNIQUE",
     # Agent world

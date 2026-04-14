@@ -202,17 +202,15 @@ async function neo4jIngest(documentId, title, source, chunks, agentId, accessLev
     try {
       const now = new Date().toISOString();
 
-      // Create Document node, then merge any image-specific metadata fields
+      // Upsert the Document node, then merge any image-specific metadata fields
       const docResult = await session.run(
-        `CREATE (d:Document {
-           document_id:  $document_id,
-           title:        $title,
-           source:       $source,
-           agent_id:     $agent_id,
-           access_level: $access_level,
-           chunk_count:  $chunk_count,
-           created_at:   $created_at
-         })
+        `MERGE (d:Document {document_id: $document_id})
+         ON CREATE SET d.created_at = $created_at
+         SET d.title        = $title,
+             d.source       = $source,
+             d.agent_id     = $agent_id,
+             d.access_level = $access_level,
+             d.chunk_count  = $chunk_count
          SET d += $image_props
          RETURN elementId(d) AS eid`,
         {
@@ -228,24 +226,22 @@ async function neo4jIngest(documentId, title, source, chunks, agentId, accessLev
       );
       const docEid = docResult.records[0].get('eid');
 
-      // Create Chunk nodes and CONTAINS relationships
+      // Upsert Chunk nodes and link them with HAS_CHUNK
       const chunkEids = [];
       for (let i = 0; i < chunks.length; i++) {
         const chunkId = `${documentId}-chunk-${i}`;
         const chunkResult = await session.run(
           `MATCH (d:Document {document_id: $document_id})
-           CREATE (c:Chunk {
-             chunk_id:       $chunk_id,
-             text:           $text,
-             position:       $position,
-             document_id:    $document_id,
-             document_title: $title,
-             agent_id:       $agent_id,
-             access_level:   $access_level,
-             confidence:     1.0,
-             created_at:     $created_at
-           })
-           CREATE (d)-[:CONTAINS]->(c)
+           MERGE (c:Chunk {chunk_id: $chunk_id})
+           ON CREATE SET c.created_at = $created_at
+           SET c.text           = $text,
+               c.position       = $position,
+               c.document_id    = $document_id,
+               c.document_title = $title,
+               c.agent_id       = $agent_id,
+               c.access_level   = $access_level,
+               c.confidence     = 1.0
+           MERGE (d)-[:HAS_CHUNK]->(c)
            RETURN elementId(c) AS eid`,
           {
             document_id: documentId,
@@ -259,6 +255,16 @@ async function neo4jIngest(documentId, title, source, chunks, agentId, accessLev
           }
         );
         chunkEids.push(chunkResult.records[0].get('eid'));
+      }
+
+      // Link consecutive chunks with :NEXT for traversal
+      for (let i = 0; i < chunkEids.length - 1; i++) {
+        await session.run(
+          `MATCH (a:Chunk) WHERE elementId(a) = $a
+           MATCH (b:Chunk) WHERE elementId(b) = $b
+           MERGE (a)-[:NEXT]->(b)`,
+          { a: chunkEids[i], b: chunkEids[i + 1] }
+        );
       }
 
       return { docEid, chunkEids };
@@ -296,10 +302,7 @@ async function qdrantIngest(collection, chunks, chunkEids, documentId, title, ag
 
   // Upsert points
   const points = chunks.map((text, i) => ({
-    id:      crypto.createHash('md5').update(chunkEids[i]).digest('hex').slice(0, 8) +
-             crypto.createHash('md5').update(chunkEids[i]).digest('hex').slice(8, 16) +
-             crypto.createHash('md5').update(chunkEids[i]).digest('hex').slice(16, 24) +
-             crypto.createHash('md5').update(chunkEids[i]).digest('hex').slice(24, 32),
+    id:      md5Uuid(chunkEids[i]),
     vector:  allVectors[i],
     payload: {
       text,

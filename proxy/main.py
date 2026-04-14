@@ -145,7 +145,13 @@ OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
 OPENAI_CHAT_MODEL    = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")
 ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_CHAT_MODEL = os.getenv("ANTHROPIC_CHAT_MODEL", "claude-sonnet-4-6")
-LLM_BACKEND          = os.getenv("LLM_BACKEND", "openai")   # openai | anthropic | ollama | openclaw
+LLM_BACKEND          = os.getenv("LLM_BACKEND", "openai")   # openai | anthropic | ollama | openclaw | copilot
+VISION_BACKEND       = os.getenv("VISION_BACKEND") or LLM_BACKEND   # separate override for vision calls
+
+# ── GitHub Copilot ──────────────────────────────────────────────────────────────
+COPILOT_API_KEY    = os.getenv("COPILOT_API_KEY", "")
+COPILOT_BASE_URL   = os.getenv("COPILOT_BASE_URL", "https://api.githubcopilot.com")
+COPILOT_CHAT_MODEL = os.getenv("COPILOT_CHAT_MODEL", "gpt-4.1")
 
 # ── OpenClaw ────────────────────────────────────────────────────────────────────
 OPENCLAW_BASE_URL      = os.getenv("OPENCLAW_BASE_URL",      "http://openclaw:18799/v1")
@@ -545,7 +551,8 @@ _EXPAND_CYPHER = {
           AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
         OPTIONAL MATCH (n)-[r]-(related)
           WHERE (related.valid_to IS NULL OR related.valid_to >= $now)
-        OPTIONAL MATCH (n)<-[:CONTAINS]-(doc:Document)
+                OPTIONAL MATCH (doc:Document)-[doc_rel]->(n)
+                    WHERE type(doc_rel) IN ['HAS_CHUNK', 'CONTAINS']
         RETURN
             properties(n) AS node, labels(n) AS labels,
             properties(doc) AS document,
@@ -559,7 +566,8 @@ _EXPAND_CYPHER = {
           AND (n.valid_from IS NULL OR n.valid_from <= $now)
           AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
         OPTIONAL MATCH (n)-[:DEPENDS_ON*1..2]->(dep)
-        OPTIONAL MATCH (n)<-[:CONTAINS]-(doc:Document)
+                OPTIONAL MATCH (doc:Document)-[doc_rel]->(n)
+                    WHERE type(doc_rel) IN ['HAS_CHUNK', 'CONTAINS']
         OPTIONAL MATCH (g:Goal)-[:DEPENDS_ON]->(n)
             WHERE (g.valid_to IS NULL OR g.valid_to >= $now)
         OPTIONAL MATCH (infer_node:Inference)-[:SUPPORTS]->(n)
@@ -578,7 +586,8 @@ _EXPAND_CYPHER = {
           AND (n.valid_from IS NULL OR n.valid_from <= $now)
           AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
         OPTIONAL MATCH path = (n)-[:DEPENDS_ON*1..3]->(dep)
-        OPTIONAL MATCH (n)<-[:CONTAINS]-(doc:Document)
+                OPTIONAL MATCH (doc:Document)-[doc_rel]->(n)
+                    WHERE type(doc_rel) IN ['HAS_CHUNK', 'CONTAINS']
         RETURN
             properties(n)  AS node, labels(n) AS labels,
             properties(doc) AS document,
@@ -601,15 +610,25 @@ _EXPAND_CYPHER = {
               AND (bel.valid_from IS NULL OR bel.valid_from <= $now)
               AND (bel.valid_to   IS NULL OR bel.valid_to   >= $now)
         OPTIONAL MATCH (evt:Event)-[:INVOLVES]->(entity)
-        OPTIONAL MATCH (n)<-[:CONTAINS]-(doc:Document)
-        RETURN
-            properties(n)   AS node, labels(n) AS labels,
-            properties(doc) AS document,
+                OPTIONAL MATCH (doc:Document)-[doc_rel]->(n)
+                    WHERE type(doc_rel) IN ['HAS_CHUNK', 'CONTAINS']
+        WITH
+            n,
+            doc,
             collect(DISTINCT properties(entity))[..5] AS concepts,
             collect(DISTINCT properties(mem))[..5]     AS memories,
             collect(DISTINCT properties(bel))[..3]     AS beliefs,
-            collect(DISTINCT properties(evt))[..5]     AS events
-        ORDER BY evt.timestamp DESC
+            collect(DISTINCT properties(evt))[..5]     AS events,
+            max(evt.timestamp) AS latest_event_ts
+        RETURN
+            properties(n)   AS node, labels(n) AS labels,
+            properties(doc) AS document,
+            concepts,
+            memories,
+            beliefs,
+            events,
+            latest_event_ts
+        ORDER BY latest_event_ts DESC
         LIMIT 20
     """,
     "semantic": """
@@ -619,7 +638,8 @@ _EXPAND_CYPHER = {
         OPTIONAL MATCH (n)-[:MENTIONS]->(entity:Entity)
         OPTIONAL MATCH (n)-[:NEXT]-(neighbor:Chunk)
           WHERE (neighbor.valid_to IS NULL OR neighbor.valid_to >= $now)
-        OPTIONAL MATCH (n)<-[:CONTAINS]-(doc:Document)
+                OPTIONAL MATCH (doc:Document)-[doc_rel]->(n)
+                    WHERE type(doc_rel) IN ['HAS_CHUNK', 'CONTAINS']
         RETURN
             properties(n)   AS node, labels(n) AS labels,
             properties(doc) AS document,
@@ -633,7 +653,8 @@ _EXPAND_CYPHER = {
           AND (n.valid_to   IS NULL OR n.valid_to   >= $now)
         OPTIONAL MATCH (n)-[:DERIVED_FROM]->(src)
         OPTIONAL MATCH (n)-[:SUPPORTS]->(tgt)
-        OPTIONAL MATCH (n)<-[:CONTAINS]-(doc:Document)
+                OPTIONAL MATCH (doc:Document)-[doc_rel]->(n)
+                    WHERE type(doc_rel) IN ['HAS_CHUNK', 'CONTAINS']
         OPTIONAL MATCH (downstream:Inference)-[:DERIVED_FROM]->(n)
             WHERE downstream.confidence >= $min_conf
               AND ($agent_id = '' OR downstream.agent_id = $agent_id)
@@ -939,7 +960,11 @@ def build_gcor_context(intent: str, qdrant_hits: list, graph_records: list, prov
                     f"{b.get('content', '')[:80]}{_confidence_badge(b)}"
                     for b in beliefs[:3]
                 ))
-            evts = [e for e in (rec.get("events") or []) if e]
+            evts = sorted(
+                [e for e in (rec.get("events") or []) if e],
+                key=lambda event: str(event.get("timestamp") or ""),
+                reverse=True,
+            )
             if evts:
                 lines.append("Events: " + "; ".join(
                     f"{e.get('timestamp', '')[:10]} {e.get('description', '')}"
@@ -1112,7 +1137,75 @@ async def call_openclaw(body: dict):
     headers = {"Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}", "Content-Type": "application/json"}
     body = {**body, "model": body.get("model", "default")}
     if body.get("stream"):
+        async def normalized_openclaw_stream(resp):
+            terminal_chunk_sent = False
+            chunk_meta = {
+                "id": f"chatcmpl_{uuid.uuid4()}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": body.get("model", "openclaw"),
+            }
+
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                if not line.startswith("data: "):
+                    yield f"{line}\n".encode()
+                    continue
+
+                raw = line[6:]
+                if raw == "[DONE]":
+                    if not terminal_chunk_sent:
+                        yield (
+                            f"data: {json.dumps({**chunk_meta, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                        ).encode()
+                    yield b"data: [DONE]\n\n"
+                    return
+
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError:
+                    yield f"data: {raw}\n\n".encode()
+                    continue
+
+                for field in ("id", "object", "created", "model"):
+                    if payload.get(field) is not None:
+                        chunk_meta[field] = payload[field]
+
+                choices = payload.get("choices") or []
+                normalized_choices = []
+                for idx, choice in enumerate(choices):
+                    normalized_choice = dict(choice)
+                    normalized_choice.setdefault("index", idx)
+                    normalized_choice.setdefault("delta", {})
+                    normalized_choice.setdefault("finish_reason", None)
+                    if normalized_choice.get("finish_reason") is not None:
+                        terminal_chunk_sent = True
+                    normalized_choices.append(normalized_choice)
+
+                normalized_payload = {
+                    **chunk_meta,
+                    **payload,
+                    "choices": normalized_choices,
+                }
+                yield f"data: {json.dumps(normalized_payload)}\n\n".encode()
+
         async def stream():
+            async def copilot_fallback_stream():
+                logger.warning("OpenClaw upstream failed; falling back to github-copilot/gpt-4.1")
+                METRIC_LLM_REQUESTS.labels(backend="openclaw", status="fallback_githubcopilot").inc()
+                # Try github-copilot/gpt-4.1 via OpenAI-compatible endpoint
+                fallback_response = await call_copilot({**body, "model": COPILOT_CHAT_MODEL, "stream": True})
+                async for chunk in fallback_response.body_iterator:
+                    yield chunk
+
+            async def ollama_fallback_stream():
+                logger.warning("OpenClaw upstream failed; falling back to Ollama model %s", OLLAMA_MODEL)
+                METRIC_LLM_REQUESTS.labels(backend="openclaw", status="fallback_ollama").inc()
+                fallback_response = await call_ollama({**body, "model": OLLAMA_MODEL, "stream": True})
+                async for chunk in fallback_response.body_iterator:
+                    yield chunk
+
             try:
                 METRIC_LLM_REQUESTS.labels(backend="openclaw", status="started").inc()
                 async with httpx.AsyncClient(timeout=300) as c:
@@ -1120,12 +1213,32 @@ async def call_openclaw(body: dict):
                         if resp.status_code != 200:
                             err = await resp.aread()
                             logger.error("OpenClaw %s: %s", resp.status_code, err[:200])
+                            if resp.status_code >= 500:
+                                # Try github-copilot/gpt-4.1 first, then Ollama if that fails
+                                try:
+                                    async for chunk in copilot_fallback_stream():
+                                        yield chunk
+                                    return
+                                except Exception as exc:
+                                    logger.error("Copilot fallback failed: %s", exc)
+                                    async for chunk in ollama_fallback_stream():
+                                        yield chunk
+                                    return
                             METRIC_LLM_REQUESTS.labels(backend="openclaw", status="error").inc()
                             yield f'data: {{"error": "OpenClaw {resp.status_code}"}}\n\n'.encode()
                             return
                         METRIC_LLM_REQUESTS.labels(backend="openclaw", status="success").inc()
-                        async for chunk in resp.aiter_bytes():
+                        async for chunk in normalized_openclaw_stream(resp):
                             yield chunk
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                logger.error("OpenClaw stream error: %s", exc)
+                try:
+                    async for chunk in copilot_fallback_stream():
+                        yield chunk
+                except Exception as exc:
+                    logger.error("Copilot fallback failed: %s", exc)
+                    async for chunk in ollama_fallback_stream():
+                        yield chunk
             except Exception as exc:
                 logger.error("OpenClaw stream error: %s", exc)
                 METRIC_LLM_REQUESTS.labels(backend="openclaw", status="exception").inc()
@@ -1140,6 +1253,32 @@ async def call_openclaw(body: dict):
             METRIC_LLM_REQUESTS.labels(backend="openclaw", status="success").inc()
             METRIC_LLM_DURATION.labels(backend="openclaw").observe(time.monotonic() - t0)
             return JSONResponse(content=resp.json(), status_code=resp.status_code)
+        except httpx.HTTPStatusError as exc:
+            error_text = exc.response.text[:500]
+            logger.error("OpenClaw %s: %s", exc.response.status_code, error_text)
+            if exc.response.status_code >= 500:
+                logger.warning("OpenClaw upstream failed; falling back to github-copilot/gpt-4.1")
+                METRIC_LLM_REQUESTS.labels(backend="openclaw", status="fallback_githubcopilot").inc()
+                try:
+                    return await call_copilot({**body, "model": COPILOT_CHAT_MODEL, "stream": False})
+                except Exception as exc:
+                    logger.error("Copilot fallback failed: %s", exc)
+                    logger.warning("Falling back to Ollama model %s", OLLAMA_MODEL)
+                    METRIC_LLM_REQUESTS.labels(backend="openclaw", status="fallback_ollama").inc()
+                    return await call_ollama({**body, "model": OLLAMA_MODEL, "stream": False})
+            METRIC_LLM_REQUESTS.labels(backend="openclaw", status="error").inc()
+            raise
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            logger.error("OpenClaw transport error: %s", exc)
+            logger.warning("OpenClaw timed out/unreachable; falling back to github-copilot/gpt-4.1")
+            METRIC_LLM_REQUESTS.labels(backend="openclaw", status="fallback_githubcopilot").inc()
+            try:
+                return await call_copilot({**body, "model": COPILOT_CHAT_MODEL, "stream": False})
+            except Exception as exc:
+                logger.error("Copilot fallback failed: %s", exc)
+                logger.warning("Falling back to Ollama model %s", OLLAMA_MODEL)
+                METRIC_LLM_REQUESTS.labels(backend="openclaw", status="fallback_ollama").inc()
+                return await call_ollama({**body, "model": OLLAMA_MODEL, "stream": False})
         except Exception:
             METRIC_LLM_REQUESTS.labels(backend="openclaw", status="error").inc()
             raise
@@ -1219,6 +1358,86 @@ async def call_openai(body: dict):
 def _is_retryable(status_code: int) -> bool:
     """Return True for status codes that warrant a retry (rate-limit, overloaded, server error)."""
     return status_code in (429, 529) or status_code >= 500
+
+
+async def call_copilot(body: dict):
+    """Forward chat completions to the GitHub Copilot OpenAI-compatible endpoint."""
+    url = f"{COPILOT_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {COPILOT_API_KEY}",
+        "Content-Type": "application/json",
+        "Copilot-Integration-Id": "gcor-proxy",
+    }
+    model = body.get("model", COPILOT_CHAT_MODEL)
+    # Strip provider prefix if passed (e.g. "github-copilot/gpt-4.1" → "gpt-4.1")
+    if "/" in model:
+        model = model.split("/", 1)[1]
+    body = {**body, "model": model}
+    if body.get("stream"):
+        async def stream():
+            for attempt in range(LLM_MAX_RETRIES + 1):
+                try:
+                    METRIC_LLM_REQUESTS.labels(backend="copilot", status="started").inc()
+                    async with httpx.AsyncClient(timeout=120) as c:
+                        async with c.stream("POST", url, json=body, headers=headers) as resp:
+                            if resp.status_code != 200:
+                                err = await resp.aread()
+                                if _is_retryable(resp.status_code) and attempt < LLM_MAX_RETRIES:
+                                    ra = resp.headers.get("retry-after")
+                                    wait = float(ra) if ra else (LLM_RETRY_BASE * (2 ** attempt) + random.uniform(0, 0.5))
+                                    logger.warning("Copilot %s (attempt %d/%d), retrying in %.1fs",
+                                                   resp.status_code, attempt + 1, LLM_MAX_RETRIES + 1, wait)
+                                    await asyncio.sleep(wait)
+                                    continue
+                                logger.error("Copilot %s: %s", resp.status_code, err[:200])
+                                METRIC_LLM_REQUESTS.labels(backend="copilot", status="error").inc()
+                                yield f'data: {{"error": "Copilot {resp.status_code}"}}\n\n'.encode()
+                                return
+                            METRIC_LLM_REQUESTS.labels(backend="copilot", status="success").inc()
+                            async for chunk in resp.aiter_bytes():
+                                yield chunk
+                            return
+                except Exception as exc:
+                    if attempt < LLM_MAX_RETRIES:
+                        wait = LLM_RETRY_BASE * (2 ** attempt) + random.uniform(0, 0.5)
+                        logger.warning("Copilot stream error (attempt %d/%d): %s, retrying in %.1fs",
+                                       attempt + 1, LLM_MAX_RETRIES + 1, exc, wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    logger.error("Copilot stream error: %s", exc)
+                    METRIC_LLM_REQUESTS.labels(backend="copilot", status="exception").inc()
+                    yield b'data: {"error": "proxy error"}\n\n'
+                    return
+        return StreamingResponse(stream(), media_type="text/event-stream")
+    else:
+        t0 = time.monotonic()
+        for attempt in range(LLM_MAX_RETRIES + 1):
+            try:
+                async with httpx.AsyncClient(timeout=120) as c:
+                    resp = await c.post(url, json=body, headers=headers)
+                    if _is_retryable(resp.status_code) and attempt < LLM_MAX_RETRIES:
+                        ra = resp.headers.get("retry-after")
+                        wait = float(ra) if ra else (LLM_RETRY_BASE * (2 ** attempt) + random.uniform(0, 0.5))
+                        logger.warning("Copilot %s (attempt %d/%d), retrying in %.1fs",
+                                       resp.status_code, attempt + 1, LLM_MAX_RETRIES + 1, wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    resp.raise_for_status()
+                METRIC_LLM_REQUESTS.labels(backend="copilot", status="success").inc()
+                METRIC_LLM_DURATION.labels(backend="copilot").observe(time.monotonic() - t0)
+                return JSONResponse(content=resp.json(), status_code=resp.status_code)
+            except httpx.HTTPStatusError:
+                METRIC_LLM_REQUESTS.labels(backend="copilot", status="error").inc()
+                raise
+            except Exception:
+                if attempt < LLM_MAX_RETRIES:
+                    wait = LLM_RETRY_BASE * (2 ** attempt) + random.uniform(0, 0.5)
+                    logger.warning("Copilot non-stream error (attempt %d/%d), retrying in %.1fs",
+                                   attempt + 1, LLM_MAX_RETRIES + 1, wait)
+                    await asyncio.sleep(wait)
+                    continue
+                METRIC_LLM_REQUESTS.labels(backend="copilot", status="error").inc()
+                raise
 
 
 async def call_anthropic(body: dict):
@@ -1494,7 +1713,7 @@ async def root():
 @app.get("/openclaw", response_class=RedirectResponse, status_code=302)
 async def openclaw_redirect():
     token = OPENCLAW_GATEWAY_TOKEN
-    base  = "http://127.0.0.1:18799"
+    base  = "http://127.0.0.1:18789"
     if token:
         return f"{base}/#token={token}"
     return base
@@ -1504,6 +1723,82 @@ async def openclaw_redirect():
 async def knowledge_ui():
     with open(os.path.join(_TEMPLATES, "knowledge.html"), encoding="utf-8") as f:
         return f.read()
+
+
+async def _qdrant_collection_doc_ids(collection: str, limit: int | None = None) -> list[str]:
+    doc_ids: list[str] = []
+    seen: set[str] = set()
+    offset = None
+
+    async with httpx.AsyncClient(timeout=30) as c:
+        while True:
+            body: dict = {
+                "limit": 100,
+                "with_payload": ["document_id"],
+                "with_vector": False,
+            }
+            if offset is not None:
+                body["offset"] = offset
+
+            resp = await c.post(f"{QDRANT_URL}/collections/{collection}/points/scroll", json=body)
+            if resp.status_code == 404:
+                raise HTTPException(status_code=404, detail=f"Collection '{collection}' not found")
+            resp.raise_for_status()
+
+            result = resp.json().get("result", {})
+            points = result.get("points", [])
+            for point in points:
+                payload = point.get("payload") or {}
+                doc_id = payload.get("document_id")
+                if doc_id and doc_id not in seen:
+                    seen.add(doc_id)
+                    doc_ids.append(doc_id)
+                    if limit and len(doc_ids) >= limit:
+                        return doc_ids
+
+            offset = result.get("next_page_offset")
+            if offset is None:
+                break
+
+    return doc_ids
+
+
+async def _neo4j_fetch_documents(doc_ids: list[str], limit: int | None = None) -> list[dict]:
+    if not doc_ids:
+        return []
+
+    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    try:
+        async with driver.session(database=NEO4J_DATABASE) as s:
+            query = (
+                "UNWIND $doc_ids AS did "
+                "MATCH (d:Document {document_id: did}) "
+                "OPTIONAL MATCH (d)-[chunk_rel]->(c:Chunk) "
+                "WHERE type(chunk_rel) IN ['HAS_CHUNK', 'CONTAINS'] "
+                "RETURN d.document_id AS doc_id, d.title AS title, "
+                "       d.created_at AS created_at, d.access_level AS access_level, "
+                "       count(c) AS chunk_count "
+                "ORDER BY d.created_at DESC"
+            )
+            if limit:
+                query += " LIMIT $limit"
+                result = await s.run(query, doc_ids=doc_ids, limit=limit)
+            else:
+                result = await s.run(query, doc_ids=doc_ids)
+            records = await result.data()
+    finally:
+        await driver.close()
+
+    return [
+        {
+            "doc_id": r["doc_id"],
+            "title": r["title"] or r["doc_id"],
+            "created_at": r["created_at"],
+            "access_level": r["access_level"],
+            "chunk_count": r["chunk_count"],
+        }
+        for r in records
+    ]
 
 
 @app.get("/api/collections")
@@ -1540,31 +1835,25 @@ async def api_collections():
             "embedding_model": EMBEDDING_MODEL,
         })
 
-    # Enrich with Neo4j document counts
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    try:
-        async with driver.session(database=NEO4J_DATABASE) as s:
-            result = await s.run(
-                "MATCH (d:Document) "
-                "RETURN d.document_id AS doc_id, d.title AS title, "
-                "       d.created_at AS created_at, d.access_level AS access_level "
-                "ORDER BY d.created_at DESC LIMIT 100"
-            )
-            records = await result.data()
-        doc_count   = len(records)
-        recent_docs = [
-            {"doc_id": r["doc_id"], "title": r["title"] or r["doc_id"],
-             "created_at": r["created_at"], "access_level": r["access_level"]}
-            for r in records[:5]
-        ]
-        for col in collections:
-            if col["name"] == QDRANT_COLLECTION:
-                col["doc_count"]   = doc_count
-                col["recent_docs"] = recent_docs
-    except Exception as exc:
-        logger.warning("Neo4j doc count failed: %s", exc)
-    finally:
-        await driver.close()
+    for col in collections:
+        try:
+            doc_ids = await _qdrant_collection_doc_ids(col["name"])
+            docs = await _neo4j_fetch_documents(doc_ids, limit=5)
+            col["doc_count"] = len(doc_ids)
+            col["recent_docs"] = [
+                {
+                    "doc_id": doc["doc_id"],
+                    "title": doc["title"],
+                    "created_at": doc["created_at"],
+                    "access_level": doc["access_level"],
+                }
+                for doc in docs
+            ]
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+        except Exception as exc:
+            logger.warning("Collection doc metadata failed for '%s': %s", col["name"], exc)
 
     return {"collections": collections, "embedding_model": EMBEDDING_MODEL}
 
@@ -1572,29 +1861,14 @@ async def api_collections():
 @app.get("/api/collections/{name}/docs")
 async def api_collection_docs(name: str):
     """List all Document nodes in Neo4j for a given collection."""
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
     try:
-        async with driver.session(database=NEO4J_DATABASE) as s:
-            result = await s.run(
-                "MATCH (d:Document) "
-                "OPTIONAL MATCH (d)-[:CONTAINS]->(c:Chunk) "
-                "RETURN d.document_id AS doc_id, d.title AS title, "
-                "       d.created_at AS created_at, d.access_level AS access_level, "
-                "       count(c) AS chunk_count "
-                "ORDER BY d.created_at DESC LIMIT 200"
-            )
-            records = await result.data()
-        docs = [
-            {"doc_id": r["doc_id"], "title": r["title"] or r["doc_id"],
-             "created_at": r["created_at"], "access_level": r["access_level"],
-             "chunk_count": r["chunk_count"]}
-            for r in records
-        ]
+        doc_ids = await _qdrant_collection_doc_ids(name, limit=200)
+        docs = await _neo4j_fetch_documents(doc_ids)
         return {"collection": name, "docs": docs}
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
-    finally:
-        await driver.close()
 
 
 _DOC_ARCHIVE_COLLECTION = "_doc_archive"
@@ -2380,7 +2654,8 @@ async def graph_backfill():
             # 1. Create NEXT links between consecutive chunks within each document
             next_result = await s.run(
                 """
-                MATCH (d:Document)-[:CONTAINS]->(c:Chunk)
+                MATCH (d:Document)-[chunk_rel]->(c:Chunk)
+                WHERE type(chunk_rel) IN ['HAS_CHUNK', 'CONTAINS']
                 WITH d, c ORDER BY c.position
                 WITH d, collect(c) AS ordered
                 UNWIND range(0, size(ordered) - 2) AS i
@@ -2412,6 +2687,48 @@ async def graph_backfill():
         "status": "ok",
         "next_links": next_count,
         "co_occurs_edges": cooc_count,
+    }
+
+
+@app.post("/api/graph-migrate-chunk-edges")
+async def graph_migrate_chunk_edges(
+    delete_legacy: bool = Query(True, description="Delete legacy CONTAINS edges after migrating to HAS_CHUNK"),
+):
+    """Normalize Document->Chunk relationships from CONTAINS to HAS_CHUNK.
+
+    Safe to call repeatedly. Existing HAS_CHUNK edges are preserved and legacy
+    CONTAINS edges can optionally be deleted after migration.
+    """
+    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    try:
+        async with driver.session(database=NEO4J_DATABASE) as s:
+            migrate_result = await s.run(
+                """
+                MATCH (d:Document)-[legacy_rel:CONTAINS]->(c:Chunk)
+                MERGE (d)-[:HAS_CHUNK]->(c)
+                RETURN count(legacy_rel) AS legacy_edges_seen
+                """
+            )
+            legacy_edges_seen = (await migrate_result.single())["legacy_edges_seen"]
+
+            deleted_legacy_edges = 0
+            if delete_legacy:
+                delete_result = await s.run(
+                    """
+                    MATCH (:Document)-[legacy_rel:CONTAINS]->(:Chunk)
+                    DELETE legacy_rel
+                    RETURN count(legacy_rel) AS deleted_legacy_edges
+                    """
+                )
+                deleted_legacy_edges = (await delete_result.single())["deleted_legacy_edges"]
+    finally:
+        await driver.close()
+
+    return {
+        "status": "ok",
+        "legacy_edges_seen": legacy_edges_seen,
+        "deleted_legacy_edges": deleted_legacy_edges,
+        "delete_legacy": delete_legacy,
     }
 
 
@@ -2675,12 +2992,43 @@ _VISION_MAX_TOKENS = int(os.getenv("VISION_MAX_TOKENS", "1200"))
 _NO_VISION         = os.getenv("NO_VISION", "0") == "1"
 
 
-async def _call_vision_api(png_b64: str, prompt: str) -> str:
-    """Send a PNG (base64) to the configured vision model and return the description."""
-    if _NO_VISION:
-        return "[Vision analysis skipped — NO_VISION=1]"
+def _available_vision_backends() -> list[str]:
+    backends = []
+    preferred = VISION_BACKEND
+    if preferred:
+        backends.append(preferred)
+    for backend in ("openai", "anthropic", "ollama"):
+        if backend not in backends:
+            backends.append(backend)
+    return backends
 
-    if LLM_BACKEND == "anthropic" and ANTHROPIC_API_KEY:
+
+async def _call_vision_backend(backend: str, png_b64: str, prompt: str) -> str:
+    if backend == "ollama":
+        ollama_vis_model = os.getenv("OLLAMA_VISION_MODEL", OLLAMA_MODEL)
+        async with httpx.AsyncClient(timeout=240) as c:
+            r = await c.post(
+                f"{OLLAMA_BASE_URL}/v1/chat/completions",
+                json={
+                    "model":      ollama_vis_model,
+                    "max_tokens": _VISION_MAX_TOKENS,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url",
+                             "image_url": {"url": f"data:image/png;base64,{png_b64}"}},
+                            {"type": "text", "text": prompt},
+                        ],
+                    }],
+                },
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"].strip()
+
+    if backend == "anthropic":
+        if not ANTHROPIC_API_KEY:
+            raise RuntimeError("Anthropic vision unavailable - no API key configured")
+        anthropic_vis_model = os.getenv("ANTHROPIC_VISION_MODEL", os.getenv("VISION_MODEL", ANTHROPIC_CHAT_MODEL))
         async with httpx.AsyncClient(timeout=60) as c:
             r = await c.post(
                 "https://api.anthropic.com/v1/messages",
@@ -2690,7 +3038,7 @@ async def _call_vision_api(png_b64: str, prompt: str) -> str:
                     "Content-Type":      "application/json",
                 },
                 json={
-                    "model":      os.getenv("VISION_MODEL", "claude-3-5-sonnet-20241022"),
+                    "model":      anthropic_vis_model,
                     "max_tokens": _VISION_MAX_TOKENS,
                     "messages": [{
                         "role": "user",
@@ -2706,30 +3054,51 @@ async def _call_vision_api(png_b64: str, prompt: str) -> str:
             r.raise_for_status()
             return r.json()["content"][0]["text"].strip()
 
-    # OpenAI fallback
-    if not OPENAI_API_KEY:
-        return "[Vision unavailable — no API key configured]"
-    async with httpx.AsyncClient(timeout=60) as c:
-        r = await c.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
-                     "Content-Type": "application/json"},
-            json={
-                "model":      os.getenv("VISION_MODEL", "gpt-4o"),
-                "max_tokens": _VISION_MAX_TOKENS,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url",
-                         "image_url": {"url": f"data:image/png;base64,{png_b64}",
-                                       "detail": "high"}},
-                        {"type": "text", "text": prompt},
-                    ],
-                }],
-            },
-        )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
+    if backend == "openai":
+        if not OPENAI_API_KEY:
+            raise RuntimeError("OpenAI vision unavailable - no API key configured")
+        openai_vis_model = os.getenv("OPENAI_VISION_MODEL", os.getenv("OPENAI_CHAT_MODEL", "gpt-4o"))
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
+                         "Content-Type": "application/json"},
+                json={
+                    "model":      openai_vis_model,
+                    "max_tokens": _VISION_MAX_TOKENS,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url",
+                             "image_url": {"url": f"data:image/png;base64,{png_b64}",
+                                           "detail": "high"}},
+                            {"type": "text", "text": prompt},
+                        ],
+                    }],
+                },
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"].strip()
+
+    raise RuntimeError(f"Unsupported vision backend: {backend}")
+
+
+async def _call_vision_api(png_b64: str, prompt: str) -> str:
+    """Send a PNG (base64) to the configured vision model and return the description."""
+    if _NO_VISION:
+        return "[Vision analysis skipped — NO_VISION=1]"
+
+    last_error = None
+    for backend in _available_vision_backends():
+        try:
+            return await _call_vision_backend(backend, png_b64, prompt)
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Vision backend '%s' failed, trying fallback: %r", backend, exc)
+
+    if last_error:
+        raise last_error
+    return "[Vision unavailable - no backend configured]"
 
 
 def _pil_to_png_b64(img) -> str:
@@ -2754,6 +3123,16 @@ def _apply_wl(arr, wc: float, ww: float):
     import numpy as np
     low, high = wc - ww / 2, wc + ww / 2
     return np.clip((arr.astype(np.float32) - low) / (ww) * 255, 0, 255).astype(np.uint8)
+
+
+def _vision_failure_text(exc: Exception, subject: str) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status == 429:
+            return f"[{subject} unavailable - vision provider rate limited (HTTP 429)]"
+        return f"[{subject} unavailable - vision provider returned HTTP {status}]"
+    detail = str(exc).strip() or exc.__class__.__name__
+    return f"[{subject} unavailable - {detail}]"
 
 
 async def _extract_image_text(filename: str, data: bytes, ext: str) -> tuple[str, dict]:
@@ -2867,7 +3246,7 @@ async def _extract_image_text(filename: str, data: bytes, ext: str) -> tuple[str
                 )
                 vision_text = await _call_vision_api(b64, prompt)
             except Exception as e:
-                vision_text = f"[Pixel rendering failed: {e}]"
+                vision_text = _vision_failure_text(e, "Visual analysis")
 
             text = meta_text
             if vision_text:
@@ -2899,6 +3278,7 @@ async def _extract_image_text(filename: str, data: bytes, ext: str) -> tuple[str
                 vox   = hdr.get_zooms()
                 dtype = str(hdr.get_data_dtype())
                 descr = hdr.get("descrip", b"").tobytes().decode("utf-8", errors="replace").strip("\x00").strip()
+                arr = nii.get_fdata()
             finally:
                 os.unlink(tmp_path)
 
@@ -2926,7 +3306,6 @@ async def _extract_image_text(filename: str, data: bytes, ext: str) -> tuple[str
 
             vision_text = ""
             try:
-                arr = nii.get_fdata()
                 if arr.ndim >= 3:
                     sl = arr[:, :, arr.shape[2] // 2]
                 elif arr.ndim == 2:
@@ -2944,7 +3323,7 @@ async def _extract_image_text(filename: str, data: bytes, ext: str) -> tuple[str
                 )
                 vision_text = await _call_vision_api(b64, prompt)
             except Exception as e:
-                vision_text = f"[Slice rendering failed: {e}]"
+                vision_text = _vision_failure_text(e, "Visual analysis")
 
             text = meta_text
             if vision_text:
@@ -3243,11 +3622,13 @@ async def _neo4j_ingest(doc_id: str, title: str, source: str,
     try:
         async with driver.session(database=NEO4J_DATABASE) as s:
             doc_rec = await s.run(
-                """CREATE (d:Document {
-                     document_id: $doc_id, title: $title, source: $source,
-                     agent_id: $agent_id, access_level: $access_level,
-                     chunk_count: $cc, created_at: $now
-                   })
+                """MERGE (d:Document {document_id: $doc_id})
+                   ON CREATE SET d.created_at = $now
+                   SET d.title = $title,
+                       d.source = $source,
+                       d.agent_id = $agent_id,
+                       d.access_level = $access_level,
+                       d.chunk_count = $cc
                    SET d += $image_props
                    RETURN elementId(d) AS eid""",
                 doc_id=doc_id, title=title, source=source,
@@ -3262,14 +3643,18 @@ async def _neo4j_ingest(doc_id: str, title: str, source: str,
                 cid = f"{doc_id}-chunk-{i}"
                 c_rec = await s.run(
                     """MATCH (d:Document {document_id: $doc_id})
-                       CREATE (c:Chunk {
-                         chunk_id: $cid, text: $text, position: $pos,
-                         document_id: $doc_id, document_title: $title,
-                         agent_id: $agent_id, access_level: $access_level,
-                         confidence: 1.0, created_at: $now,
-                         valid_from: $now, valid_to: $valid_to
-                       })
-                       CREATE (d)-[:CONTAINS]->(c)
+                                             MERGE (c:Chunk {chunk_id: $cid})
+                                             ON CREATE SET c.created_at = $now
+                                             SET c.text = $text,
+                                                     c.position = $pos,
+                                                     c.document_id = $doc_id,
+                                                     c.document_title = $title,
+                                                     c.agent_id = $agent_id,
+                                                     c.access_level = $access_level,
+                                                     c.confidence = 1.0,
+                                                     c.valid_from = $now,
+                                                     c.valid_to = $valid_to
+                                             MERGE (d)-[:HAS_CHUNK]->(c)
                        RETURN elementId(c) AS eid""",
                     doc_id=doc_id, cid=cid, text=text, pos=i,
                     title=title, agent_id=agent_id, access_level=access_level,
@@ -3282,7 +3667,7 @@ async def _neo4j_ingest(doc_id: str, title: str, source: str,
                 await s.run(
                     """MATCH (a:Chunk) WHERE elementId(a) = $a
                        MATCH (b:Chunk) WHERE elementId(b) = $b
-                       CREATE (a)-[:NEXT]->(b)""",
+                       MERGE (a)-[:NEXT]->(b)""",
                     a=chunk_eids[j], b=chunk_eids[j + 1],
                 )
         return doc_eid, chunk_eids

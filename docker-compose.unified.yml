@@ -1,3 +1,8 @@
+x-neo4j-credentials: &neo4j-creds
+  NEO4J_URI: bolt://neo4j:7687
+  NEO4J_USER: neo4j
+  NEO4J_PASSWORD: ${NEO4J_PASSWORD:-test1234}
+
 services:
 
   # ── Data stores ───────────────────────────────────────────────────────────────
@@ -8,7 +13,7 @@ services:
       - "7474:7474"
       - "7687:7687"
     environment:
-      NEO4J_AUTH: neo4j/test1234
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-test1234}
     volumes:
       - neo4j_data:/data
     healthcheck:
@@ -21,9 +26,7 @@ services:
   neo4j-exporter:
     build: ./neo4j-exporter
     environment:
-      NEO4J_URI: bolt://neo4j:7687
-      NEO4J_USER: neo4j
-      NEO4J_PASSWORD: test1234
+      <<: *neo4j-creds
       NEO4J_DATABASE: neo4j
     depends_on:
       neo4j:
@@ -86,6 +89,7 @@ services:
   mcp-qdrant:
     build: ./mcp-servers/qdrant
     environment:
+      <<: *neo4j-creds
       QDRANT_URL: http://qdrant:6333
       COLLECTION_NAME: ${QDRANT_COLLECTION:-documents}
       QDRANT_MCP_HOST: 0.0.0.0
@@ -96,11 +100,6 @@ services:
       EMBEDDING_BACKEND: ${EMBEDDING_BACKEND:-ollama}
       OLLAMA_BASE_URL: http://ollama:11434
       OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
-      # Neo4j (needed by sync_neo4j_to_qdrant tool)
-      NEO4J_URI: bolt://neo4j:7687
-      NEO4J_USER: neo4j
-      NEO4J_PASSWORD: test1234
-      # Cognitive infrastructure
       DEFAULT_ACCESS_LEVEL: ${DEFAULT_ACCESS_LEVEL:-public}
     depends_on:
       qdrant:
@@ -112,18 +111,29 @@ services:
   mcp-neo4j:
     build: ./mcp-servers/neo4j
     environment:
-      NEO4J_URI: bolt://neo4j:7687
-      NEO4J_USERNAME: neo4j
-      NEO4J_PASSWORD: test1234
+      <<: *neo4j-creds
       NEO4J_DATABASE: neo4j
       NEO4J_MCP_SERVER_HOST: 0.0.0.0
       NEO4J_MCP_SERVER_PORT: "8766"
-      # Cognitive infrastructure
       DEFAULT_ACCESS_LEVEL: ${DEFAULT_ACCESS_LEVEL:-public}
     depends_on:
       neo4j:
         condition: service_healthy
     restart: unless-stopped
+
+  openclaw-config-init:
+    image: alpine:3.20
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        mkdir -p /config
+        cp /seed/openclaw.json /config/openclaw.json
+        chown -R 1000:1000 /config
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR:-openclaw_config}:/config
+      - ./openclaw-config/openclaw.json:/seed/openclaw.json:ro
+    restart: "no"
 
   # ── OpenClaw + relay ──────────────────────────────────────────────────────────
 
@@ -132,33 +142,42 @@ services:
       context: .
       dockerfile: openclaw/Dockerfile
     depends_on:
-      - mcp-qdrant
-      - mcp-neo4j
+      openclaw-config-init:
+        condition: service_completed_successfully
+      mcp-qdrant:
+        condition: service_started
+      mcp-neo4j:
+        condition: service_started
     ports:
-      - "18799:18799"
-      - "18801:18801"
+      - "18789:18799"
+      - "18790:18801"
       - "9091:9091"
     environment:
+      <<: *neo4j-creds
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
+      COPILOT_API_KEY: ${COPILOT_API_KEY:-}
+      COPILOT_GITHUB_TOKEN: ${COPILOT_API_KEY:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       OPENCLAW_GATEWAY_PORT: ${OPENCLAW_GATEWAY_PORT:-18789}
       OPENCLAW_BRIDGE_PORT: ${OPENCLAW_BRIDGE_PORT:-18790}
       OPENCLAW_GATEWAY_BIND: ${OPENCLAW_GATEWAY_BIND:-lan}
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
-      OPENCLAW_GATEWAY_PASSWORD: ${OPENCLAW_GATEWAY_PASSWORD}
       OPENCLAW_CONFIG_DIR: /home/node/.openclaw
       OPENCLAW_WORKSPACE_DIR: /home/node/.openclaw/workspace
       OPENCLAW_DOCKER_APT_PACKAGES: ${OPENCLAW_DOCKER_APT_PACKAGES:-}
-      # Driver scripts
-      NEO4J_URI: bolt://neo4j:7687
-      NEO4J_USER: neo4j
-      NEO4J_PASSWORD: test1234
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-documents}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
     volumes:
       - ${OPENCLAW_CONFIG_DIR:-openclaw_config}:/home/node/.openclaw
+      - ./openclaw-config/openclaw.json:/opt/openclaw-seed/openclaw.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/localhost/18799' || exit 0"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
 
   # ── GCOR Proxy ────────────────────────────────────────────────────────────────
@@ -175,28 +194,31 @@ services:
       ollama:
         condition: service_healthy
     environment:
+      <<: *neo4j-creds
       # LLM backend — set LLM_BACKEND=ollama to use local models
       LLM_BACKEND: ${LLM_BACKEND:-anthropic}
-      OLLAMA_VISION_MODEL: llava:7b
+      VISION_BACKEND: ${VISION_BACKEND:-anthropic}
+      VISION_MODEL: ${VISION_MODEL:-claude-3-5-sonnet-20241022}
+      OLLAMA_VISION_MODEL: ${OLLAMA_VISION_MODEL:-llava:7b}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       OPENAI_CHAT_MODEL: ${OPENAI_CHAT_MODEL:-gpt-4o}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       ANTHROPIC_CHAT_MODEL: ${ANTHROPIC_CHAT_MODEL:-claude-haiku-4-5-20251001}
+      # GitHub Copilot
+      COPILOT_API_KEY: ${COPILOT_API_KEY:-}
+      COPILOT_BASE_URL: ${COPILOT_BASE_URL:-https://api.githubcopilot.com}
+      COPILOT_CHAT_MODEL: ${COPILOT_CHAT_MODEL:-gpt-4.1}
       # Ollama
       OLLAMA_BASE_URL: http://ollama:11434
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2}
       OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
-      # Embedding backend — set EMBEDDING_BACKEND=ollama to use nomic-embed-text locally
+      # Embedding
       EMBEDDING_BACKEND: ${EMBEDDING_BACKEND:-ollama}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
       # Qdrant
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-documents}
       QDRANT_TOP_K: ${QDRANT_TOP_K:-8}
-      # Neo4j
-      NEO4J_URI: bolt://neo4j:7687
-      NEO4J_USER: neo4j
-      NEO4J_PASSWORD: test1234
       # OpenClaw backend
       OPENCLAW_BASE_URL: ${OPENCLAW_BASE_URL:-http://openclaw:18799/v1}
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-}
@@ -206,9 +228,9 @@ services:
       CONFIDENCE_THRESHOLD: ${CONFIDENCE_THRESHOLD:-0.0}
       AGENT_ID: ${AGENT_ID:-}
       DEFAULT_ACCESS_LEVEL: ${DEFAULT_ACCESS_LEVEL:-public}
-      VISION_BACKEND: ${VISION_BACKEND:-anthropic}
     volumes:
       - ./proxy/main.py:/app/main.py:ro
+      - ./proxy/document_intel.py:/app/document_intel.py:ro
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:5001/health')"]
@@ -216,6 +238,21 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  # ── TTS (OpenAI-compatible Edge TTS) ─────────────────────────────────────────
+
+  tts:
+    image: travisvn/openai-edge-tts:latest
+    ports:
+      - "5050:5050"
+    environment:
+      PORT: "5050"
+      API_KEY: ${TTS_API_KEY:-tts-local}
+      REQUIRE_API_KEY: "true"
+      DEFAULT_VOICE: ${TTS_DEFAULT_VOICE:-en-US-AriaNeural}
+      DEFAULT_RESPONSE_FORMAT: ${TTS_DEFAULT_FORMAT:-mp3}
+      DEFAULT_SPEED: ${TTS_DEFAULT_SPEED:-1.0}
+    restart: unless-stopped
 
   # ── OpenWebUI ─────────────────────────────────────────────────────────────────
 
@@ -230,13 +267,17 @@ services:
       RAG_OPENAI_API_BASE_URL: http://proxy:5001/v1
       RAG_OPENAI_API_KEY: openclaw
       ENABLE_RAG_LOCAL_WEB_FETCH: "false"
-      # RESET_CONFIG_ON_START — enable temporarily to apply env changes, then disable
-      # RESET_CONFIG_ON_START: "true"
       # Ollama — fallback model when Anthropic is unavailable
       OLLAMA_BASE_URL: http://ollama:11434
       DEFAULT_MODELS: openclaw
       DEFAULT_USER_ROLE: user
       ENABLE_MODEL_FILTER: "false"
+      # TTS — OpenAI-compatible Edge TTS
+      AUDIO_TTS_ENGINE: openai
+      AUDIO_TTS_OPENAI_API_BASE_URL: http://tts:5050/v1
+      AUDIO_TTS_OPENAI_API_KEY: ${TTS_API_KEY:-tts-local}
+      AUDIO_TTS_MODEL: tts-1
+      AUDIO_TTS_VOICE: ${TTS_DEFAULT_VOICE:-en-US-AriaNeural}
     volumes:
       - openwebui_data:/app/backend/data
     depends_on:
@@ -244,6 +285,8 @@ services:
         condition: service_healthy
       ollama:
         condition: service_healthy
+      tts:
+        condition: service_started
 
   # ── Monitoring ────────────────────────────────────────────────────────────────
 
