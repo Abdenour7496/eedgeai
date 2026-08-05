@@ -1,0 +1,94 @@
+version: "3.9"
+
+# ── buzzG add-on stack ────────────────────────────────────────────────────────
+# Attaches to Buzz's existing Docker network so gcor-proxy can reach Buzz's
+# Postgres and MinIO without extra port-forwarding or network bridges.
+#
+# Usage:
+#   cp .env.example .env   # fill in BUZZ_NETWORK + Postgres/MinIO creds
+#   docker compose -f docker-compose.gcor.yml up -d
+
+networks:
+  buzz:
+    external: true
+    name: ${BUZZ_NETWORK:-buzz_default}
+
+services:
+
+  # ── One-shot migration ──────────────────────────────────────────────────────
+  gcor-migrate:
+    image: pgvector/pgvector:pg16
+    restart: "no"
+    environment:
+      PGHOST:     ${POSTGRES_HOST:-postgres}
+      PGPORT:     ${POSTGRES_PORT:-5432}
+      PGUSER:     ${POSTGRES_USER:-buzz}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-buzz}
+      PGDATABASE: ${POSTGRES_DB:-buzz}
+    volumes:
+      - ./migrations:/migrations:ro
+    entrypoint: >
+      sh -c "
+        until pg_isready -h $$PGHOST -p $$PGPORT; do
+          echo 'waiting for postgres…'; sleep 2;
+        done &&
+        psql -f /migrations/0001_gcor_schema.sql
+      "
+    networks: [buzz]
+
+  # ── GCOR ingestion + retrieval proxy ───────────────────────────────────────
+  gcor-proxy:
+    build:
+      context: ./proxy
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      gcor-migrate:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_HOST:     ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT:     ${POSTGRES_PORT:-5432}
+      POSTGRES_USER:     ${POSTGRES_USER:-buzz}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-buzz}
+      POSTGRES_DB:       ${POSTGRES_DB:-buzz}
+      MINIO_HOST:        ${MINIO_HOST:-minio:9000}
+      MINIO_ROOT_USER:   ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET:      ${MINIO_BUCKET:-gcor-objects}
+      MINIO_SECURE:      ${MINIO_SECURE:-false}
+      EMBEDDING_BACKEND: ${EMBEDDING_BACKEND:-openai}
+      EMBEDDING_MODEL:   ${EMBEDDING_MODEL:-text-embedding-3-small}
+      EMBEDDING_DIMS:    ${EMBEDDING_DIMS:-1536}
+      OPENAI_API_KEY:    ${OPENAI_API_KEY:-}
+      OLLAMA_BASE_URL:   ${OLLAMA_BASE_URL:-http://ollama:11434}
+      CHUNK_SIZE:        ${CHUNK_SIZE:-512}
+      CHUNK_OVERLAP:     ${CHUNK_OVERLAP:-64}
+      INGEST_WEBHOOK_SECRET: ${INGEST_WEBHOOK_SECRET:-}
+    ports:
+      - "5001:5001"
+    networks: [buzz]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── MCP server (SSE transport) ──────────────────────────────────────────────
+  mcp-postgres-gcor:
+    build:
+      context: ./mcp-postgres-gcor
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      gcor-proxy:
+        condition: service_healthy
+    environment:
+      GCOR_PROXY_URL: ${GCOR_PROXY_URL:-http://gcor-proxy:5001}
+    ports:
+      - "8765:8765"
+    networks: [buzz]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5

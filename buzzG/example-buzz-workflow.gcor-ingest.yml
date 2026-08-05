@@ -1,0 +1,35 @@
+# example-buzz-workflow.gcor-ingest.yml
+#
+# Drop this file into Buzz's workflow directory to automatically ingest new
+# channel messages and NIP-34 git patch events into the GCOR pipeline.
+#
+# See buzz/VISION_AGENT.md and the buzz-workflow docs for the exact directory
+# path and trigger schema for your Buzz version.
+
+name: gcor-ingest
+description: >
+  Forward new Buzz messages and git patch events to gcor-proxy for
+  chunking, embedding, and graph indexing.
+
+triggers:
+  - type: message
+    channels: ["*"]          # all channels; restrict as needed, e.g. ["#dev", "#general"]
+  - type: git_event
+    event_kinds: [1, 2, 3]  # NIP-34 patch / issue / PR kinds
+
+steps:
+  - name: ingest-to-gcor
+    action: http.post
+    config:
+      url: "http://gcor-proxy:5001/api/ingest"
+      headers:
+        Content-Type: "application/x-www-form-urlencoded"
+        X-Webhook-Secret: "${INGEST_WEBHOOK_SECRET}"
+      body: |
+        text={{ event.content | urlencode }}&
+        title={{ event.id | default('buzz-event') }}&
+        source_type={{ event.kind | map_kind }}&
+        source_ref={{ event.id }}&
+        access_level=team
+      timeout: 30s
+    on_error: continue   # don't block Buzz if gcor-proxy is temporarily down
