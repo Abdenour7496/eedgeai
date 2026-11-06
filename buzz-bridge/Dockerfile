@@ -21,7 +21,7 @@
 #                  the proxy's /v1/buzz/ingest (image attachments, storage_key
 #                  lookups); avoids hand-rolling multipart/form-data in stdlib.
 # Pinned to a release tag so this doesn't move under us on rebuild.
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.99-bookworm AS builder
 
 ARG BUZZ_REF=v0.4.24
 RUN apt-get update && apt-get install -y --no-install-recommends \

@@ -1,6 +1,6 @@
 # EedgeAI
 
-EedgeAI is a local-first agent and retrieval stack. Graphiti provides temporal knowledge extraction and hybrid retrieval, FalkorDB stores the graph and vectors, OpenClaw provides agent tools, Open WebUI provides chat, and MinIO preserves original documents.
+EedgeAI is a local-first agent and retrieval stack. Graphiti provides temporal knowledge extraction and hybrid retrieval, FalkorDB stores the graph and vectors, OpenClaw provides agent tools, Open WebUI provides chat, and SeaweedFS (S3-compatible) preserves original documents.
 
 ## Current architecture
 
@@ -44,7 +44,8 @@ The first start downloads Qwen 2.5 7B, Nomic Embed Text, Llama 3.2, and LLaVA, s
 | Graphiti REST | http://localhost:8000/docs | knowledge ingestion and retrieval |
 | FalkorDB Browser | http://localhost:3001 | graph inspection |
 | FalkorDB | localhost:6379 | graph/vector database |
-| MinIO console | http://localhost:9001 | original documents |
+| SeaweedFS S3 API | http://localhost:9000 | original documents (S3) |
+| SeaweedFS admin UI | http://localhost:9001 | storage admin (set `SEAWEEDFS_ADMIN_PASSWORD`) |
 | OpenClaw | http://localhost:18799 | agent gateway |
 | Prometheus | http://localhost:9090 | metrics |
 | Grafana | http://localhost:3000 | dashboards |
@@ -56,7 +57,7 @@ curl -F "file=@report.pdf" -F "collection=documents" http://localhost:5001/api/i
 curl "http://localhost:5001/api/search?q=your+question&collection=documents"
 ```
 
-The MinIO watcher also processes objects placed under `documents/inbox/`.
+The ingest watcher also processes objects placed under `documents/inbox/`.
 
 ## Operations
 
@@ -72,3 +73,23 @@ Graphiti groups replace Qdrant collections. A group is materialized on first ing
 ## Configuration
 
 See `.env.example`. The important settings are `GRAPHITI_API_BASE_URL`, `GRAPHITI_MODEL`, `GRAPHITI_EMBEDDING_MODEL`, `GRAPHITI_EMBEDDING_DIM`, and `GRAPHITI_GROUP_ID`. Do not commit `.env` or credentials.
+
+## Upgrading from the MinIO-based stack
+
+MinIO stopped publishing container images in October 2025 and its repository was
+archived in April 2026, so document storage now runs on SeaweedFS. Existing
+documents live in the old `docs_minio_data` volume and are copied across once:
+
+```bash
+# 1. Back up the Open WebUI and FalkorDB volumes (v0.13 runs DB migrations).
+# 2. Start the new stack, then copy the old objects into SeaweedFS
+#    (needs a MinIO image still cached locally; set LEGACY_MINIO_IMAGE if needed):
+docker compose -f docker-compose.unified.yml --profile migrate run --rm storage-migrate
+docker compose -f docker-compose.unified.yml --profile migrate rm -sf minio-legacy
+```
+
+The copy is idempotent (re-running skips objects already copied) and never
+modifies the source volume. Remove `docs_minio_data` only after verifying.
+
+FalkorDB stays on 4.x for now: 6.x has no supported upgrade path for 4.x data
+until 6.2.

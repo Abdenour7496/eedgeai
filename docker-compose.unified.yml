@@ -3,7 +3,10 @@ services:
   # ── Data stores ───────────────────────────────────────────────────────────────
 
   falkordb:
-    image: falkordb/falkordb:latest
+    # Pinned to the newest 4.x. FalkorDB 6.x (Rust engine) has no supported
+    # in-place upgrade path from 4.x data until 6.2 — do not move to 6.x on an
+    # existing falkordb_data volume until then.
+    image: falkordb/falkordb:4.22.3
     ports:
       - "6379:6379"
       - "3001:3000"
@@ -56,7 +59,7 @@ services:
     restart: unless-stopped
 
   graphiti-mcp:
-    image: zepai/knowledge-graph-mcp:standalone
+    image: zepai/knowledge-graph-mcp:1.1.3-standalone
     environment:
       CONFIG_PATH: /app/mcp/config/config.yaml
       OPENAI_API_URL: ${GRAPHITI_API_BASE_URL:-http://ollama:11434/v1}
@@ -88,7 +91,7 @@ services:
   # ── Ollama (local LLM) ────────────────────────────────────────────────────────
 
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.40.15
     ports:
       - "11434:11434"
     volumes:
@@ -110,7 +113,7 @@ services:
     restart: unless-stopped
 
   ollama-init:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.40.15
     depends_on:
       ollama:
         condition: service_healthy
@@ -126,7 +129,7 @@ services:
     restart: "no"
 
   openclaw-config-init:
-    image: alpine:3.20
+    image: alpine:3.24
     command:
       - /bin/sh
       - -lc
@@ -185,9 +188,9 @@ services:
       EMBEDDING_BACKEND: ${EMBEDDING_BACKEND:-ollama}
       OLLAMA_BASE_URL: http://ollama:11434
       OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
-      # Document storage (MinIO) for ingest-cli — best-effort, same as the
+      # Document storage (SeaweedFS S3) for ingest-cli — best-effort, same as the
       # proxy's own copy of these vars; ingestion still works if unset/unreachable.
-      S3_ENDPOINT_URL: http://minio:9000
+      S3_ENDPOINT_URL: http://seaweedfs:8333
       S3_ACCESS_KEY: ${DOCS_S3_ACCESS_KEY:-gcor_docs}
       S3_SECRET_KEY: ${DOCS_S3_SECRET_KEY:-gcor_docs_secret}
       S3_BUCKET: ${DOCS_S3_BUCKET:-documents}
@@ -250,8 +253,8 @@ services:
       CONFIDENCE_THRESHOLD: ${CONFIDENCE_THRESHOLD:-0.0}
       AGENT_ID: ${AGENT_ID:-}
       DEFAULT_ACCESS_LEVEL: ${DEFAULT_ACCESS_LEVEL:-public}
-      # Document storage (MinIO) — best-effort; ingestion still works if unset/unreachable.
-      S3_ENDPOINT_URL: http://minio:9000
+      # Document storage (SeaweedFS S3) — best-effort; ingestion still works if unset/unreachable.
+      S3_ENDPOINT_URL: http://seaweedfs:8333
       S3_ACCESS_KEY: ${DOCS_S3_ACCESS_KEY:-gcor_docs}
       S3_SECRET_KEY: ${DOCS_S3_SECRET_KEY:-gcor_docs_secret}
       S3_BUCKET: ${DOCS_S3_BUCKET:-documents}
@@ -268,14 +271,48 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  # ── Document storage (MinIO, S3-compatible) ───────────────────────────────────
+  # ── Document storage (SeaweedFS, S3-compatible) ───────────────────────────────
+  # Replaces MinIO, which stopped publishing images (Oct 2025) and was archived
+  # (Apr 2026). `weed mini` runs master+volume+filer+S3 in one container.
+  # AWS_ACCESS_KEY_ID/SECRET become the S3 admin identity, so anonymous access
+  # is denied and buckets are private. -bucket creates both buckets at startup
+  # (idempotent), replacing the old minio-init container.
 
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.52
+    command:
+      - mini
+      - -bucket=${DOCS_S3_BUCKET:-documents},${OPENWEBUI_S3_BUCKET:-openwebui}
+      - -admin.password=${SEAWEEDFS_ADMIN_PASSWORD:-}
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      # Host ports kept from the MinIO layout: 9000 = S3 API, 9001 = admin UI.
+      # Only S3 and the admin UI are published; filer/master/volume gRPC stay
+      # on the internal network.
+      - "9000:8333"
+      - "9001:12535"
+    environment:
+      AWS_ACCESS_KEY_ID: ${DOCS_S3_ACCESS_KEY:-gcor_docs}
+      AWS_SECRET_ACCESS_KEY: ${DOCS_S3_SECRET_KEY:-gcor_docs_secret}
+    volumes:
+      - seaweedfs_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8333/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  # One-off copy of documents from the old MinIO volume into SeaweedFS.
+  # Only runs when asked:  docker compose -f docker-compose.unified.yml \
+  #   --profile migrate run --rm storage-migrate
+  # Needs a MinIO image already cached locally (Docker Hub no longer serves it);
+  # override with LEGACY_MINIO_IMAGE if yours is tagged differently.
+  minio-legacy:
+    profiles: ["migrate"]
+    image: ${LEGACY_MINIO_IMAGE:-minio/minio:latest}
+    pull_policy: never
+    command: server /data
     environment:
       MINIO_ROOT_USER: ${DOCS_S3_ACCESS_KEY:-gcor_docs}
       MINIO_ROOT_PASSWORD: ${DOCS_S3_SECRET_KEY:-gcor_docs_secret}
@@ -286,27 +323,25 @@ services:
       interval: 5s
       timeout: 5s
       retries: 12
-      start_period: 10s
-    restart: unless-stopped
+    restart: "no"
 
-  minio-init:
-    image: minio/mc:latest
+  storage-migrate:
+    profiles: ["migrate"]
+    build: ./ingest-watcher
     depends_on:
-      minio:
+      minio-legacy:
+        condition: service_healthy
+      seaweedfs:
         condition: service_healthy
     environment:
-      DOCS_S3_ACCESS_KEY: ${DOCS_S3_ACCESS_KEY:-gcor_docs}
-      DOCS_S3_SECRET_KEY: ${DOCS_S3_SECRET_KEY:-gcor_docs_secret}
-      DOCS_S3_BUCKET: ${DOCS_S3_BUCKET:-documents}
-      OPENWEBUI_S3_BUCKET: ${OPENWEBUI_S3_BUCKET:-openwebui}
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - >-
-        mc alias set local http://minio:9000 "$${DOCS_S3_ACCESS_KEY}" "$${DOCS_S3_SECRET_KEY}"
-        && mc mb --ignore-existing "local/$${DOCS_S3_BUCKET}"
-        && mc anonymous set none "local/$${DOCS_S3_BUCKET}"
-        && mc mb --ignore-existing "local/$${OPENWEBUI_S3_BUCKET}"
-        && mc anonymous set none "local/$${OPENWEBUI_S3_BUCKET}"
+      SRC_ENDPOINT_URL: http://minio-legacy:9000
+      DST_ENDPOINT_URL: http://seaweedfs:8333
+      S3_ACCESS_KEY: ${DOCS_S3_ACCESS_KEY:-gcor_docs}
+      S3_SECRET_KEY: ${DOCS_S3_SECRET_KEY:-gcor_docs_secret}
+      MIGRATE_BUCKETS: ${DOCS_S3_BUCKET:-documents},${OPENWEBUI_S3_BUCKET:-openwebui}
+    volumes:
+      - ./tools/migrate_s3.py:/app/migrate_s3.py:ro
+    command: ["python", "migrate_s3.py"]
     restart: "no"
 
   # Polls documents/inbox/ and pushes new files into the proxy's /api/ingest —
@@ -314,12 +349,12 @@ services:
   ingest-watcher:
     build: ./ingest-watcher
     depends_on:
-      minio-init:
-        condition: service_completed_successfully
+      seaweedfs:
+        condition: service_healthy
       proxy:
         condition: service_healthy
     environment:
-      S3_ENDPOINT_URL: http://minio:9000
+      S3_ENDPOINT_URL: http://seaweedfs:8333
       S3_ACCESS_KEY: ${DOCS_S3_ACCESS_KEY:-gcor_docs}
       S3_SECRET_KEY: ${DOCS_S3_SECRET_KEY:-gcor_docs_secret}
       S3_BUCKET: ${DOCS_S3_BUCKET:-documents}
@@ -351,7 +386,7 @@ services:
   # ── OpenWebUI ─────────────────────────────────────────────────────────────────
 
   openwebui:
-    image: ghcr.io/open-webui/open-webui:v0.11.0
+    image: ghcr.io/open-webui/open-webui:v0.13.0
     ports:
       - "8080:8080"
     environment:
@@ -372,11 +407,11 @@ services:
       AUDIO_TTS_OPENAI_API_KEY: ${TTS_API_KEY:-tts-local}
       AUDIO_TTS_MODEL: tts-1
       AUDIO_TTS_VOICE: ${TTS_DEFAULT_VOICE:-en-US-AriaNeural}
-      # File/attachment storage on the stack-wide MinIO instance (see
-      # minio-init) instead of the local volume — the sqlite DB, config, etc.
+      # File/attachment storage on the stack-wide SeaweedFS S3 store (bucket
+      # created by the seaweedfs service at startup) instead of the local volume — the sqlite DB, config, etc.
       # still live on openwebui_data below; only uploaded files move to S3.
       STORAGE_PROVIDER: s3
-      S3_ENDPOINT_URL: http://minio:9000
+      S3_ENDPOINT_URL: http://seaweedfs:8333
       S3_ACCESS_KEY_ID: ${DOCS_S3_ACCESS_KEY:-gcor_docs}
       S3_SECRET_ACCESS_KEY: ${DOCS_S3_SECRET_KEY:-gcor_docs_secret}
       S3_REGION_NAME: us-east-1
@@ -390,14 +425,14 @@ services:
         condition: service_healthy
       tts:
         condition: service_started
-      minio-init:
-        condition: service_completed_successfully
+      seaweedfs:
+        condition: service_healthy
     restart: unless-stopped
 
   # ── Monitoring ────────────────────────────────────────────────────────────────
 
   falkordb-exporter:
-    image: oliver006/redis_exporter:latest
+    image: oliver006/redis_exporter:v1.97.0
     environment:
       REDIS_ADDR: redis://falkordb:6379
       REDIS_PASSWORD: ${FALKORDB_PASSWORD:-}
@@ -407,7 +442,7 @@ services:
     restart: unless-stopped
 
   prometheus:
-    image: prom/prometheus
+    image: prom/prometheus:v3.16.0
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
@@ -420,7 +455,7 @@ services:
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana
+    image: grafana/grafana:13.3.0
     ports:
       - "3000:3000"
     environment:
@@ -442,7 +477,9 @@ volumes:
   openclaw_claude_config:
   openwebui_data:
   ollama_data:
+  # Legacy MinIO volume — kept so `--profile migrate` can copy it into SeaweedFS.
   docs_minio_data:
+  seaweedfs_data:
   buzz_postgres_data:
   buzz_redis_data:
   buzz_git_data:

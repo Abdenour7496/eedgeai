@@ -48,7 +48,7 @@ const GRAPHITI_URL        = (process.env.GRAPHITI_URL || 'http://graphiti:8000')
 // proxy/main.py's _store_original_to_s3, so a document ingested via either
 // path lands in the same place. Best-effort: ingestion still succeeds if
 // MinIO is unreachable or unconfigured, it just skips persisting the original.
-const S3_ENDPOINT_URL     = process.env.S3_ENDPOINT_URL     || 'http://minio:9000';
+const S3_ENDPOINT_URL     = process.env.S3_ENDPOINT_URL     || 'http://seaweedfs:8333';
 const S3_ACCESS_KEY       = process.env.S3_ACCESS_KEY       || '';
 const S3_SECRET_KEY       = process.env.S3_SECRET_KEY       || '';
 const S3_BUCKET           = process.env.S3_BUCKET           || 'documents';

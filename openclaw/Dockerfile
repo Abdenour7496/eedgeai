@@ -1,4 +1,4 @@
-FROM ghcr.io/openclaw/openclaw:2026.6.11
+FROM ghcr.io/openclaw/openclaw:2026.11.1
 
 USER root
 
@@ -36,6 +36,10 @@ COPY openclaw-relay/relay.js .
 
 # Patch the bundled OpenClaw runtime so stale assistant-side provider errors
 # do not get misattributed to later fallback candidates.
+# NOTE (2026.11.x): upstream rewrote these code paths (bundles are now .mjs,
+# per-attempt assistant errors, typed Copilot auth errors), so all three
+# patches log a warning and skip. Kept for older base images; the Copilot
+# premium-allowance -> rate_limit classification is no longer applied.
 COPY openclaw/hotfix-openclaw-runtime.js /tmp/hotfix-openclaw-runtime.js
 RUN node /tmp/hotfix-openclaw-runtime.js && rm -f /tmp/hotfix-openclaw-runtime.js
 

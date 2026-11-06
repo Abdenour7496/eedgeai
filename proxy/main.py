@@ -298,7 +298,7 @@ BUZZ_BRIDGE_MAX_UPLOAD_BYTES = int(os.getenv("BUZZ_BRIDGE_MAX_UPLOAD_BYTES", str
 # ── Document storage (MinIO, S3-compatible) ───────────────────────────────────
 # Best-effort: ingestion still works if MinIO is unreachable or unconfigured,
 # it just skips persisting the original file.
-S3_ENDPOINT_URL      = os.getenv("S3_ENDPOINT_URL", "http://minio:9000")
+S3_ENDPOINT_URL      = os.getenv("S3_ENDPOINT_URL", "http://seaweedfs:8333")
 S3_ACCESS_KEY        = os.getenv("S3_ACCESS_KEY", "")
 S3_SECRET_KEY        = os.getenv("S3_SECRET_KEY", "")
 S3_BUCKET            = os.getenv("S3_BUCKET", "documents")
