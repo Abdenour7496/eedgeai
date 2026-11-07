@@ -1,3 +1,7 @@
+# Compose project name: containers, networks and volumes are prefixed aiedge-*
+# regardless of the folder the repo is cloned into.
+name: aiedge
+
 services:
 
   # ── Data stores ───────────────────────────────────────────────────────────────

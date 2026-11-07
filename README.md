@@ -65,7 +65,7 @@ The ingest watcher also processes objects placed under `documents/inbox/`.
 docker compose -f docker-compose.unified.yml ps
 docker compose -f docker-compose.unified.yml logs -f graphiti graphiti-mcp falkordb proxy
 curl http://localhost:8000/healthcheck
-docker exec eedgeai-falkordb-1 redis-cli PING
+docker exec aiedge-falkordb-1 redis-cli PING
 ```
 
 Graphiti groups replace Qdrant collections. A group is materialized on first ingest. Renaming groups is intentionally unsupported; deleting a group deletes its Graphiti episodes and facts.
