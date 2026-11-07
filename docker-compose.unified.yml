@@ -10,7 +10,7 @@ services:
     # Pinned to the newest 4.x. FalkorDB 6.x (Rust engine) has no supported
     # in-place upgrade path from 4.x data until 6.2 — do not move to 6.x on an
     # existing falkordb_data volume until then.
-    image: falkordb/falkordb:4.22.3
+    image: falkordb/falkordb:v4.22.3
     ports:
       - "6379:6379"
       - "3001:3000"
